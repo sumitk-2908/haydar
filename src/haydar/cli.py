@@ -117,6 +117,8 @@ def init(
     rprint("[bold]Starting initial index...[/bold]\n")
     try:
         from haydar.indexer.engine import IndexingEngine
+        
+        rprint("[dim]Downloading embedding model (~80 MB); first run only, this may take a minute...[/dim]")
 
         with IndexingEngine(config, allow_download=True) as engine:
             stats = engine.index_all()

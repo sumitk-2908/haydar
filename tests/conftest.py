@@ -33,6 +33,7 @@ def tmp_haydar(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "MODELS_DIR", models, raising=False)
     monkeypatch.setattr(config, "CACHE_DIR", cache, raising=False)
     monkeypatch.setattr(config, "RIPGREP_DIR", bin_dir, raising=False)
+    monkeypatch.setattr(config, "INDEX_LOCK", root / ".indexing.lock", raising=False)
 
     # Patch copies captured by other modules if they are already imported.
     for mod_name, names in {
