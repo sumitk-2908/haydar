@@ -75,41 +75,53 @@ class ResultItem(QFrame):
         layout.setSpacing(12)
         
         # Icon
-        icon_label = QLabel(_get_file_icon(result.file_type))
-        icon_label.setStyleSheet("font-size: 24px; background: transparent;")
-        icon_label.setFixedWidth(32)
-        icon_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(icon_label)
+        self.icon_label = QLabel(_get_file_icon(result.file_type))
+        self.icon_label.setStyleSheet("font-size: 24px; background: transparent;")
+        self.icon_label.setFixedWidth(32)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.icon_label)
         
         # Center info
         info_layout = QVBoxLayout()
         info_layout.setSpacing(2)
         
-        filename_label = QLabel(result.filename)
-        filename_label.setStyleSheet("font-weight: bold; color: white; font-size: 14px; background: transparent;")
+        self.filename_label = QLabel(result.filename)
+        self.filename_label.setStyleSheet("font-weight: bold; color: white; font-size: 14px; background: transparent;")
         
-        path_label = QLabel(result.folder)
-        path_label.setStyleSheet("color: #aaaaaa; font-size: 11px; background: transparent;")
+        self.path_label = QLabel(result.folder)
+        self.path_label.setStyleSheet("color: #aaaaaa; font-size: 11px; background: transparent;")
         
         snippet = result.snippet
         if len(snippet) > 100:
             snippet = snippet[:97] + "..."
         highlighted_snippet = _highlight_snippet(snippet, query)
         
-        snippet_label = QLabel(highlighted_snippet)
-        snippet_label.setStyleSheet("color: #cccccc; font-size: 12px; background: transparent;")
-        snippet_label.setWordWrap(True)
+        self.snippet_label = QLabel(highlighted_snippet)
+        self.snippet_label.setStyleSheet("color: #cccccc; font-size: 12px; background: transparent;")
+        self.snippet_label.setWordWrap(True)
         
-        info_layout.addWidget(filename_label)
-        info_layout.addWidget(path_label)
-        info_layout.addWidget(snippet_label)
+        info_layout.addWidget(self.filename_label)
+        info_layout.addWidget(self.path_label)
+        info_layout.addWidget(self.snippet_label)
         layout.addLayout(info_layout, stretch=1)
         
         # Score
-        score_label = QLabel(f"{int(result.score * 100)}%")
-        score_label.setStyleSheet("color: #888888; font-size: 11px; background: transparent;")
-        score_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
-        layout.addWidget(score_label)
+        self.score_label = QLabel(f"{int(result.score * 100)}%")
+        self.score_label.setStyleSheet("color: #888888; font-size: 11px; background: transparent;")
+        self.score_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        layout.addWidget(self.score_label)
+
+    def update_result(self, result: SearchResult, query: str):
+        self.result = result
+        self.icon_label.setText(_get_file_icon(result.file_type))
+        self.filename_label.setText(result.filename)
+        self.path_label.setText(result.folder)
+        
+        snippet = result.snippet
+        if len(snippet) > 100:
+            snippet = snippet[:97] + "..."
+        self.snippet_label.setText(_highlight_snippet(snippet, query))
+        self.score_label.setText(f"{int(result.score * 100)}%")
 
     def set_selected(self, selected: bool):
         self.setProperty("selected", selected)
@@ -132,24 +144,31 @@ class ResultsList(QWidget):
         self.selected_index = -1
         
     def set_results(self, results: list[SearchResult], query: str):
-        # Clear existing
-        for i in reversed(range(self.layout.count())):
-            widget = self.layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
-        
         self.results = results
-        self.items = []
-        self.selected_index = -1
         
-        for result in results:
-            item = ResultItem(result, query)
+        # Add missing widgets
+        while len(self.items) < len(results):
+            item = ResultItem(results[len(self.items)], query)
             self.items.append(item)
             self.layout.addWidget(item)
             
-        if self.items:
-            self.selected_index = 0
-            self.items[0].set_selected(True)
+        # Remove extra widgets
+        while len(self.items) > len(results):
+            item = self.items.pop()
+            self.layout.removeWidget(item)
+            item.deleteLater()
+            
+        # Update existing widgets
+        for i, result in enumerate(results):
+            self.items[i].update_result(result, query)
+            self.items[i].show()
+            
+        if self.items and self.selected_index < 0:
+            self._set_selected_index(0)
+        elif self.items and self.selected_index >= len(self.items):
+            self._set_selected_index(len(self.items) - 1)
+        elif not self.items:
+            self.selected_index = -1
             
     def get_selected_result(self) -> SearchResult | None:
         if 0 <= self.selected_index < len(self.results):

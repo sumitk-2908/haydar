@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "haydar"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fast, local semantic file search for Windows. Find files by what they contain, not what they're named."
 readme = "README.md"
 license = "MIT"
@@ -54,14 +54,24 @@ dev = [
 [project.scripts]
 haydar = "haydar.cli:app"
 
+[project.gui-scripts]
+haydar-ui = "haydar.cli:launch_ui"
+
 [project.urls]
 Homepage = "https://github.com/haydar-search/haydar"
 Documentation = "https://haydar.dev"
 Repository = "https://github.com/haydar-search/haydar"
 Issues = "https://github.com/haydar-search/haydar/issues"
 
+[tool.hatch.version]
+path = "src/haydar/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/haydar"]
+
+# Note: ripgrep is NOT vendored in the wheel. For pip installs it is fetched
+# (with SHA-256 verification) on first `haydar init`. The PyInstaller EXE bundles
+# it at build time instead (see haydar.spec).
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

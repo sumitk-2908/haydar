@@ -15,6 +15,7 @@ from haydar.config import (
     TEXT_EXTENSIONS,
     CODE_EXTENSIONS,
     IMAGE_EXTENSIONS,
+    CACHE_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,25 +130,46 @@ def _extract_image(filepath: Path) -> Optional[ExtractedContent]:
             text=text,
             metadata={}
         )
+    except pytesseract.TesseractNotFoundError:
+        logger.warning("Tesseract OCR engine is not installed or not in your PATH. Please install Tesseract from https://github.com/UB-Mannheim/tesseract/wiki and restart Haydar.")
+        return None
     except Exception as e:
         logger.warning(f"Failed to extract image {filepath}: {e}")
         return None
 
 
-def extract_text(filepath: Path) -> Optional[ExtractedContent]:
+def extract_text(filepath: Path, file_hash: Optional[str] = None) -> Optional[ExtractedContent]:
     """
     Dispatch text extraction based on file extension.
     """
     ext = filepath.suffix.lower()
     
+    cache_path = None
+    if file_hash:
+        cache_path = CACHE_DIR / f"{file_hash}.txt"
+        if cache_path.exists():
+            try:
+                text = cache_path.read_text(encoding="utf-8")
+                return ExtractedContent(text=text, metadata={"cached": True})
+            except Exception:
+                pass
+    
     if ext == ".pdf":
-        return _extract_pdf(filepath)
+        result = _extract_pdf(filepath)
     elif ext == ".docx":
-        return _extract_docx(filepath)
+        result = _extract_docx(filepath)
     elif ext in TEXT_EXTENSIONS or ext in CODE_EXTENSIONS:
-        return _extract_text(filepath)
+        result = _extract_text(filepath)
     elif ext in IMAGE_EXTENSIONS:
-        return _extract_image(filepath)
+        result = _extract_image(filepath)
     else:
         logger.warning(f"Unsupported extension {ext} for {filepath}")
         return None
+        
+    if result and cache_path:
+        try:
+            cache_path.write_text(result.text, encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to write cache for {filepath}: {e}")
+            
+    return result

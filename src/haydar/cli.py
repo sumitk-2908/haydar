@@ -85,29 +85,20 @@ def init(
                 validated.append(str(p))
             else:
                 rprint(f"[yellow]! Skipping '{f}' -- not a valid directory[/yellow]")
-        config.folders = validated
+        for v in validated:
+            if v not in config.folders:
+                config.folders.append(v)
     else:
-        # Interactive: show defaults, ask for confirmation
+        # Default to the user's common document folders
         defaults = _default_folders()
         if not defaults:
             rprint("[yellow]No default folders found. Please specify with --folders.[/yellow]")
             raise typer.Exit(1)
 
-        rprint("\n[bold]Folders to index:[/bold]")
-        for i, folder in enumerate(defaults, 1):
-            rprint(f"  [cyan]{i}.[/cyan] {folder}")
-
-        if not yes:
-            rprint("")
-            confirm = typer.confirm(
-                "Index these folders?",
-                default=True,
-            )
-            if not confirm:
-                rprint("\n[dim]Run [bold]haydar init --folders PATH[/bold] to specify custom folders.[/dim]")
-                raise typer.Exit(0)
-
-        config.folders = defaults
+        for d in defaults:
+            if d not in config.folders:
+                rprint(f"Adding [cyan]{d}[/cyan] to the Haydar index...")
+                config.folders.append(d)
 
     if not config.folders:
         rprint("[red]x No folders to index. Aborting.[/red]")
@@ -121,13 +112,14 @@ def init(
     rprint("[green]>[/green] Config saved to [dim]{0}[/dim]".format(HAYDAR_DIR))
     rprint("[green]>[/green] Database at [dim]{0}[/dim]\n".format(DB_DIR))
 
-    # Run initial index
+    _ensure_ripgrep()
+
     rprint("[bold]Starting initial index...[/bold]\n")
     try:
         from haydar.indexer.engine import IndexingEngine
 
-        engine = IndexingEngine(config)
-        stats = engine.index_all()
+        with IndexingEngine(config, allow_download=True) as engine:
+            stats = engine.index_all()
 
         rprint("")
         _print_index_stats(stats)
@@ -136,6 +128,9 @@ def init(
         rprint("[dim]Run [bold]haydar watch[/bold] to start the file watcher.[/dim]")
     except Exception as exc:
         rprint(f"\n[red]x Indexing failed: {exc}[/red]")
+        hint = getattr(exc, "hint", None)
+        if hint:
+            rprint(f"[dim]{hint}[/dim]")
         rprint("[dim]Your config has been saved. Run [bold]haydar init[/bold] again to retry.[/dim]")
         raise typer.Exit(1)
 
@@ -154,10 +149,19 @@ def search(
         "--limit", "-n",
         help="Maximum number of results to display.",
     ),
+    mode: str = typer.Option(
+        "semantic",
+        "--mode", "-m",
+        help="Search mode: 'semantic' (meaning-based) or 'keyword' (ripgrep exact match).",
+    ),
 ) -> None:
     """Search your files -- by content, semantically."""
     config = HaydarConfig.load()
     _check_initialized(config)
+
+    if mode not in ("semantic", "keyword"):
+        rprint(f"[red]x Invalid mode '{mode}'. Use 'semantic' or 'keyword'.[/red]")
+        raise typer.Exit(1)
 
     if query is None:
         # Launch floating UI
@@ -176,7 +180,7 @@ def search(
             from haydar.search.hybrid import HybridSearch
 
             searcher = HybridSearch(config)
-            results = searcher.search(query, limit=limit)
+            results = searcher.search(query, limit=limit, mode=mode)
 
             if not results:
                 rprint(f"\n[yellow]No results found for '{query}'[/yellow]")
@@ -203,8 +207,7 @@ def search(
             console.print(table)
 
         except Exception as exc:
-            rprint(f"[red]x Search failed: {exc}[/red]")
-            raise typer.Exit(1)
+            _fail(exc)
 
 
 # -- haydar watch ---------------------------------------------------------------
@@ -243,9 +246,19 @@ def watch(
 
     try:
         from haydar.indexer.watcher import FileWatcher
-
         watcher = FileWatcher(config)
-        watcher.start()  # Blocks until Ctrl+C
+
+        try:
+            from haydar.ui.window import launch_search_window
+            # Start watcher in background
+            watcher.start(blocking=False)
+            rprint("[dim]Watcher running in background. UI hotkey active.[/dim]")
+            launch_search_window(config)
+        except ImportError:
+            # UI dependencies not installed, run blocking watcher
+            rprint("[dim]UI dependencies not found. Watcher running in blocking mode.[/dim]")
+            watcher.start(blocking=True)
+            
     except KeyboardInterrupt:
         rprint("\n[yellow]Watcher stopped.[/yellow]")
     except Exception as exc:
@@ -271,8 +284,7 @@ def status() -> None:
         stats = store.get_stats()
         _print_index_stats(stats)
     except Exception as exc:
-        rprint(f"[red]x Could not read index: {exc}[/red]")
-        raise typer.Exit(1)
+        _fail(exc)
 
     rprint(f"\n[bold]Config:[/bold]")
     rprint(f"  [dim]Model:[/dim]     {config.embedding_model}")
@@ -388,15 +400,95 @@ def reindex() -> None:
     try:
         from haydar.indexer.engine import IndexingEngine
 
-        engine = IndexingEngine(config)
-        stats = engine.index_all(force=True)
+        with IndexingEngine(config, allow_download=True) as engine:
+            stats = engine.index_all(force=True)
 
         rprint("")
         _print_index_stats(stats)
         rprint("\n[green bold]+ Re-index complete![/green bold]")
     except Exception as exc:
         rprint(f"[red]x Re-indexing failed: {exc}[/red]")
+        hint = getattr(exc, "hint", None)
+        if hint:
+            rprint(f"[dim]{hint}[/dim]")
         raise typer.Exit(1)
+
+
+# -- haydar uninstall -------------------------------------------------------------
+
+
+@app.command()
+def uninstall(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print what would be deleted without actually deleting anything.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes", "-y",
+        help="Skip interactive confirmation.",
+    )
+) -> None:
+    """Uninstall Haydar: remove data, config, and autostart script."""
+    import shutil
+    import time
+    
+    startup_dir = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    bat_path = startup_dir / "haydar_watcher.bat"
+    
+    rprint("[bold]Uninstalling Haydar...[/bold]\n")
+    
+    if dry_run:
+        rprint("[yellow]DRY RUN - No files will be deleted.[/yellow]")
+        if HAYDAR_DIR.exists():
+            rprint(f"Would backup and delete: [cyan]{HAYDAR_DIR}[/cyan]")
+        else:
+            rprint(f"Would delete: [cyan]{HAYDAR_DIR}[/cyan] (Not found)")
+            
+        if bat_path.exists():
+            rprint(f"Would delete: [cyan]{bat_path}[/cyan]")
+        else:
+            rprint(f"Would delete: [cyan]{bat_path}[/cyan] (Not found)")
+        raise typer.Exit(0)
+        
+    if not yes:
+        confirm = typer.confirm("This will permanently delete your Haydar index and configuration. A backup will be saved to your Desktop. Continue?", default=False)
+        if not confirm:
+            raise typer.Exit(0)
+            
+    # Backup
+    if HAYDAR_DIR.exists():
+        timestamp = int(time.time())
+        desktop = Path.home() / "Desktop"
+        backup_dir = desktop if desktop.exists() else Path.home()
+        backup_path = backup_dir / f"haydar_backup_{timestamp}"
+        
+        rprint(f"Creating backup of {HAYDAR_DIR}...")
+        try:
+            shutil.make_archive(str(backup_path), 'zip', str(HAYDAR_DIR))
+            rprint(f"[green]+[/green] Backup saved to: {backup_path}.zip")
+        except Exception as e:
+            rprint(f"[red]x[/red] Failed to create backup: {e}")
+            rprint("Aborting uninstall to prevent data loss.")
+            raise typer.Exit(1)
+            
+        # Delete ~/.haydar
+        try:
+            shutil.rmtree(HAYDAR_DIR)
+            rprint(f"[green]+[/green] Deleted {HAYDAR_DIR}")
+        except Exception as e:
+            rprint(f"[red]x[/red] Failed to delete {HAYDAR_DIR}: {e}")
+            
+    # Delete autostart
+    if bat_path.exists():
+        try:
+            bat_path.unlink()
+            rprint(f"[green]+[/green] Removed autostart script {bat_path}")
+        except Exception as e:
+            rprint(f"[red]x[/red] Failed to remove autostart script: {e}")
+            
+    rprint("\n[green bold]+ Haydar uninstalled successfully.[/green bold]")
 
 
 # -- haydar version -------------------------------------------------------------
@@ -419,18 +511,78 @@ def main(
     ),
 ) -> None:
     """Haydar -- Find any file by what it contains, not what it's named."""
-    pass
+    from haydar.logging_setup import setup_logging
+
+    setup_logging()
 
 
 # -- Helpers --------------------------------------------------------------------
 
 
+def launch_ui() -> None:
+    """Entry point for the `haydar-ui` gui-script (windowed, no console)."""
+    from haydar.gui_main import main
+
+    main()
+
+
+def _ensure_ripgrep() -> None:
+    """Ensure ripgrep is available for keyword search; fetch it if missing.
+
+    Failure is non-fatal: keyword search will be unavailable but semantic
+    search still works, so we warn rather than abort init.
+    """
+    from haydar.config import get_rg_path, HaydarConfigError, RIPGREP_DIR
+
+    try:
+        get_rg_path()
+        return
+    except HaydarConfigError:
+        pass
+
+    rprint("[dim]Fetching ripgrep (for keyword search)...[/dim]")
+    try:
+        from haydar.ripgrep import ensure_ripgrep
+
+        path = ensure_ripgrep(RIPGREP_DIR)
+        rprint(f"[green]>[/green] ripgrep ready at [dim]{path}[/dim]")
+    except Exception as exc:
+        rprint(f"[yellow]! Could not fetch ripgrep: {exc}[/yellow]")
+        rprint("[dim]Keyword search will be unavailable. Semantic search still works.[/dim]")
+
+
+def _fail(exc: Exception) -> None:
+    """Print a friendly error (with hint if present) and raise typer.Exit(1).
+
+    Re-raises typer.Exit unchanged so a deliberate clean exit (e.g. exit code 0
+    for 'no results') inside a try/except is not turned into a failure.
+    """
+    from haydar.search.store import VectorStoreError
+
+    if isinstance(exc, typer.Exit):
+        raise exc
+
+    rprint(f"[red]x {exc}[/red]")
+    hint = exc.hint if isinstance(exc, VectorStoreError) else getattr(exc, "hint", None)
+    if hint:
+        rprint(f"[dim]{hint}[/dim]")
+    raise typer.Exit(1)
+
+
 def _check_initialized(config: HaydarConfig) -> None:
-    """Abort if Haydar hasn't been initialized."""
+    """Abort if Haydar hasn't been initialized, or if DB schema is outdated."""
     if not config.initialized:
         rprint(
             "[red]x Haydar is not initialized.[/red]\n"
             "[dim]Run [bold]haydar init[/bold] first to set up your index.[/dim]"
+        )
+        raise typer.Exit(1)
+        
+    from haydar.config import CURRENT_SCHEMA_VERSION
+    if config.schema_version != CURRENT_SCHEMA_VERSION:
+        rprint(
+            f"[red]x Database schema update required (v{config.schema_version} -> v{CURRENT_SCHEMA_VERSION}).[/red]\n"
+            "[dim]Please run [bold]haydar reindex[/bold] to update your database.[/dim]"
         )
         raise typer.Exit(1)
 

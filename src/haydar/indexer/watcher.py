@@ -120,8 +120,9 @@ class FileWatcher:
     def __init__(self, config: HaydarConfig):
         self.config = config
         self.engine = IndexingEngine(config)
+        self._observer = None
 
-    def start(self) -> None:
+    def start(self, blocking: bool = True) -> None:
         """Start the file watcher."""
         if not self.config.folders:
             logger.warning("No folders configured to watch.")
@@ -139,17 +140,31 @@ class FileWatcher:
                 logger.warning(f"Configured folder does not exist or is not a directory: {folder}")
 
         observer.start()
-        logger.info("File watcher started. Press Ctrl+C to stop.")
-        
+        logger.info("File watcher started.")
+
+        if not blocking:
+            self._observer = observer
+            return
+
+        logger.info("Press Ctrl+C to stop.")
         try:
             while observer.is_alive():
                 observer.join(timeout=1)
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received. Stopping watcher...")
+        finally:
             observer.stop()
-            
-        observer.join()
-        logger.info("Watcher stopped.")
+            observer.join()
+            logger.info("Watcher stopped.")
+
+    def stop(self) -> None:
+        """Stop a non-blocking observer started via start(blocking=False)."""
+        observer = getattr(self, "_observer", None)
+        if observer is not None:
+            observer.stop()
+            observer.join()
+            self._observer = None
+            logger.info("Watcher stopped.")
 
 
 def install_autostart() -> None:

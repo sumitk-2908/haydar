@@ -6,23 +6,63 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import concurrent.futures
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Any
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from haydar.config import HaydarConfig, ALL_INDEXABLE_EXTENSIONS, is_excluded, get_size_category
 from haydar.indexer.extractors import extract_text
+from haydar.indexer.cache import FileCache
 from haydar.search.store import VectorStore
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ExtractionResult:
+    filepath: str
+    file_hash: Optional[str]
+    chunks: list[dict]
+    error: Optional[str]
+    skipped_reason: Optional[str]
+
 class IndexingEngine:
-    def __init__(self, config: HaydarConfig):
+    def __init__(self, config: HaydarConfig, allow_download: bool = False):
         self.config = config
-        self.store = VectorStore(config)
+        self.store = VectorStore(config, allow_download=allow_download)
+        self.cache = FileCache()
+
+    def _extract_worker(self, filepath: Path, config: HaydarConfig, force: bool) -> ExtractionResult:
+        try:
+            try:
+                file_size = filepath.stat().st_size
+            except OSError as e:
+                return ExtractionResult(str(filepath), None, [], None, f"Could not read (locked/permission): {e}")
+                
+            ext = filepath.suffix.lower()
+            category = get_size_category(ext)
+            limit = config.size_limits.get(category, 0)
+            if file_size > limit:
+                return ExtractionResult(str(filepath), None, [], None, f"Exceeds {category} limit")
+
+            try:
+                file_hash = self._compute_hash(filepath)
+            except OSError as e:
+                return ExtractionResult(str(filepath), None, [], None, f"Could not hash: {e}")
+                
+            extracted = extract_text(filepath, file_hash=file_hash)
+            if not extracted or not extracted.text.strip():
+                return ExtractionResult(str(filepath), file_hash, [], None, None) # Zero chunks
+
+            chunks = self._chunk_text(extracted.text, config.chunk_size, config.chunk_overlap)
+            return ExtractionResult(str(filepath), file_hash, chunks, None, None)
+        except Exception as e:
+            return ExtractionResult(str(filepath), None, [], str(e), None)
 
     def index_all(self, force: bool = False) -> dict:
-        """Index all files in configured folders."""
+        """Index all files using a producer-consumer pipeline with batching."""
         stats = {
             "files_indexed": 0,
             "chunks_stored": 0,
@@ -32,19 +72,98 @@ class IndexingEngine:
             "total_text_bytes": 0
         }
 
+        # 1. Crawl filesystem and pre-filter
         files_to_process = []
+        current_disk_paths = set()
+        
         for folder_path in self.config.folders:
             folder = Path(folder_path)
             if not folder.exists() or not folder.is_dir():
                 continue
                 
-            for filepath in folder.rglob('*'):
-                if not filepath.is_file():
-                    continue
-                files_to_process.append(filepath)
+            def _on_error(exc):
+                logger.debug(f"Skipping inaccessible path: {exc.filename}")
+
+            for root, dirs, files in os.walk(folder, onerror=_on_error):
+                dirs[:] = [d for d in dirs if not is_excluded(Path(root) / d, self.config.excluded_patterns)]
+                
+                for file in files:
+                    filepath = Path(root) / file
+                    try:
+                        if not filepath.is_file():
+                            continue
+                        file_stat = filepath.stat()
+                        mtime = file_stat.st_mtime
+                        size = file_stat.st_size
+                    except OSError:
+                        continue
+                        
+                    ext = filepath.suffix.lower()
+                    if ext not in ALL_INDEXABLE_EXTENSIONS:
+                        continue
+                    if is_excluded(filepath, self.config.excluded_patterns):
+                        continue
+                        
+                    abs_path_str = str(filepath.absolute())
+                    current_disk_paths.add(abs_path_str)
+                    
+                    if not force:
+                        cached = self.cache.get(abs_path_str)
+                        if cached and cached["mtime"] == mtime and cached["size"] == size:
+                            stats["files_skipped_unchanged"] += 1
+                            continue
+                            
+                    files_to_process.append(filepath)
+
+        # 2. Invalidation Pass
+        all_cached = self.cache.get_all_filepaths()
+        deleted_files = list(all_cached - current_disk_paths)
+        if deleted_files:
+            logger.info(f"Removing {len(deleted_files)} deleted files from index.")
+            self.store.delete_by_filepaths(deleted_files)
+            self.cache.remove_many(deleted_files)
+
+        if not files_to_process:
+            return stats
+
+        # 3. Producer-Consumer Pipeline
+        batch_ids = []
+        batch_documents = []
+        batch_metadatas = []
+        batch_deletions = []
+        cache_updates = []
+
+        def flush_batch():
+            nonlocal batch_ids, batch_documents, batch_metadatas, batch_deletions, cache_updates
+            if not batch_ids and not batch_deletions:
+                return
+
+            try:
+                if batch_deletions:
+                    self.store.delete_by_filepaths(batch_deletions)
+                if batch_ids:
+                    self.store.add_documents(ids=batch_ids, documents=batch_documents, metadatas=batch_metadatas)
+                    stats["chunks_stored"] += len(batch_ids)
+                
+                # Update cache only after successful flush
+                for update in cache_updates:
+                    self.cache.set(*update)
+                    stats["files_indexed"] += 1
+            except Exception as e:
+                logger.error(f"Failed to flush batch. Affected files: {batch_deletions}. Error: {e}")
+                stats["files_skipped_error"] += len(cache_updates)
+            finally:
+                batch_ids.clear()
+                batch_documents.clear()
+                batch_metadatas.clear()
+                batch_deletions.clear()
+                cache_updates.clear()
+
+        import multiprocessing
+        max_workers = min(32, (os.cpu_count() or 1) + 4)
+        submission_window = max_workers * 4
 
         with Progress(
-            SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
@@ -52,91 +171,78 @@ class IndexingEngine:
         ) as progress:
             task = progress.add_task("[cyan]Indexing files...", total=len(files_to_process))
             
-            for filepath in files_to_process:
-                progress.advance(task)
-                
-                ext = filepath.suffix.lower()
-                if ext not in ALL_INDEXABLE_EXTENSIONS:
-                    continue
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Chunked submission loop
+                for i in range(0, len(files_to_process), submission_window):
+                    batch_files = files_to_process[i:i + submission_window]
+                    futures = {
+                        executor.submit(self._extract_worker, f, self.config, force): f 
+                        for f in batch_files
+                    }
                     
-                if is_excluded(filepath, self.config.excluded_patterns):
-                    continue
-                    
-                try:
-                    file_size = filepath.stat().st_size
-                except OSError:
-                    stats["files_skipped_error"] += 1
-                    continue
-                    
-                category = get_size_category(ext)
-                limit = self.config.size_limits.get(category, 0)
-                if file_size > limit:
-                    size_mb = file_size / (1024 * 1024)
-                    limit_mb = limit / (1024 * 1024)
-                    logger.warning(f"Skipped {filepath.name} ({size_mb:.1f} MB) — exceeds {category} limit of {limit_mb:.1f} MB")
-                    stats["files_skipped_size"] += 1
-                    continue
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            result = future.result()
+                        except Exception as e:
+                            logger.error(f"Catastrophic worker failure: {e}")
+                            stats["files_skipped_error"] += 1
+                            progress.advance(task)
+                            continue
+                            
+                        filepath_str = result.filepath
+                        progress.advance(task)
+                        
+                        if result.skipped_reason:
+                            logger.debug(f"Skipped {filepath_str}: {result.skipped_reason}")
+                            if "Exceeds" in result.skipped_reason:
+                                stats["files_skipped_size"] += 1
+                            continue
+                            
+                        if result.error:
+                            logger.error(f"Error extracting {filepath_str}: {result.error}")
+                            stats["files_skipped_error"] += 1
+                            continue
 
-                try:
-                    file_hash = self._compute_hash(filepath)
-                except OSError:
-                    stats["files_skipped_error"] += 1
-                    continue
-                    
-                if not force:
-                    existing_hash = self.store.get_file_hash(str(filepath.absolute()))
-                    if existing_hash == file_hash:
-                        stats["files_skipped_unchanged"] += 1
-                        continue
+                        # It's a valid file. Get stat to cache.
+                        try:
+                            f_stat = os.stat(filepath_str)
+                            mtime = f_stat.st_mtime
+                            size = f_stat.st_size
+                        except OSError:
+                            continue
+                            
+                        batch_deletions.append(filepath_str)
 
-                try:
-                    extracted = extract_text(filepath)
-                    if not extracted or not extracted.text.strip():
-                        stats["files_skipped_error"] += 1
-                        continue
+                        if not result.chunks:
+                            # Zero-chunk file (empty or unreadable valid extension)
+                            cache_updates.append((filepath_str, mtime, size, result.file_hash, 0))
+                            continue
+                            
+                        # Create a unique prefix for this file's chunks to avoid ChromaDB ID collisions for identical files
+                        path_hash = hashlib.md5(filepath_str.encode('utf-8')).hexdigest()
                         
-                    stats["total_text_bytes"] += len(extracted.text.encode('utf-8'))
-                    chunks = self._chunk_text(extracted.text, self.config.chunk_size, self.config.chunk_overlap)
-                    
-                    if not chunks:
-                        stats["files_skipped_error"] += 1
-                        continue
-                        
-                    self.store.delete_by_filepath(str(filepath.absolute()))
-                    
-                    ids = []
-                    documents = []
-                    metadatas = []
-                    
-                    mod_time = os.path.getmtime(filepath)
-                    
-                    for i, chunk in enumerate(chunks):
-                        ids.append(f"{file_hash}_{i}")
-                        documents.append(chunk)
-                        metadatas.append({
-                            "file_path": str(filepath.absolute()),
-                            "file_type": ext,
-                            "chunk_index": i,
-                            "file_hash": file_hash,
-                            "modified_time": mod_time,
-                            "filename": filepath.name
-                        })
-                        
-                    batch_size = 100
-                    for i in range(0, len(ids), batch_size):
-                        self.store.add_documents(
-                            ids=ids[i:i + batch_size],
-                            documents=documents[i:i + batch_size],
-                            metadatas=metadatas[i:i + batch_size]
-                        )
-                        stats["chunks_stored"] += len(ids[i:i + batch_size])
-                        
-                    stats["files_indexed"] += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error indexing {filepath}: {e}")
-                    stats["files_skipped_error"] += 1
+                        for i, chunk_info in enumerate(result.chunks):
+                            batch_ids.append(f"{path_hash}_{i}")
+                            batch_documents.append(chunk_info["text"])
+                            batch_metadatas.append({
+                                "file_path": filepath_str,
+                                "file_type": Path(filepath_str).suffix.lower(),
+                                "chunk_index": i,
+                                "start_char": chunk_info["start_char"],
+                                "end_char": chunk_info["end_char"],
+                                "file_hash": result.file_hash,
+                                "modified_time": mtime,
+                                "filename": Path(filepath_str).name
+                            })
+                            stats["total_text_bytes"] += len(chunk_info["text"].encode('utf-8'))
+                            
+                        cache_updates.append((filepath_str, mtime, size, result.file_hash, len(result.chunks)))
 
+                        if len(batch_ids) >= self.config.embedding_batch_size:
+                            flush_batch()
+
+        # Final flush for any remaining chunks
+        flush_batch()
         return stats
 
     def index_file(self, filepath: Path) -> bool:
@@ -150,7 +256,7 @@ class IndexingEngine:
             
         try:
             file_hash = self._compute_hash(filepath)
-            extracted = extract_text(filepath)
+            extracted = extract_text(filepath, file_hash=file_hash)
             if not extracted or not extracted.text.strip():
                 return False
                 
@@ -165,13 +271,16 @@ class IndexingEngine:
             metadatas = []
             mod_time = os.path.getmtime(filepath)
             
-            for i, chunk in enumerate(chunks):
-                ids.append(f"{file_hash}_{i}")
-                documents.append(chunk)
+            path_hash = hashlib.md5(str(filepath.absolute()).encode('utf-8')).hexdigest()
+            for i, chunk_info in enumerate(chunks):
+                ids.append(f"{path_hash}_{i}")
+                documents.append(chunk_info["text"])
                 metadatas.append({
                     "file_path": str(filepath.absolute()),
                     "file_type": ext,
                     "chunk_index": i,
+                    "start_char": chunk_info["start_char"],
+                    "end_char": chunk_info["end_char"],
                     "file_hash": file_hash,
                     "modified_time": mod_time,
                     "filename": filepath.name
@@ -185,34 +294,58 @@ class IndexingEngine:
                     metadatas=metadatas[i:i + batch_size]
                 )
                 
+            self.cache.set(str(filepath.absolute()), mod_time, filepath.stat().st_size, file_hash, len(chunks))
             return True
         except Exception:
             return False
 
     def remove_file(self, filepath: Path) -> None:
         """Remove a file from the index."""
-        self.store.delete_by_filepath(str(filepath.absolute()))
+        abs_path = str(filepath.absolute())
+        self.store.delete_by_filepath(abs_path)
+        self.cache.remove(abs_path)
+
+    def close(self) -> None:
+        """Release resources (the SQLite cache connection)."""
+        try:
+            self.cache.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "IndexingEngine":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     @staticmethod
-    def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-        """Split text into overlapping chunks of words."""
-        words = text.split()
+    def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[dict]:
+        """Split text into overlapping chunks of words, retaining original char offsets."""
+        import re
+        word_spans = [(m.start(), m.end(), m.group()) for m in re.finditer(r'\S+', text)]
         chunks = []
         
-        if not words:
+        if not word_spans:
             return chunks
             
         i = 0
-        while i < len(words):
-            end_idx = min(i + chunk_size, len(words))
-            chunk_words = words[i:end_idx]
+        while i < len(word_spans):
+            end_idx = min(i + chunk_size, len(word_spans))
+            chunk_words = word_spans[i:end_idx]
             
             if len(chunk_words) < 20 and chunks:
                 break
                 
-            chunks.append(" ".join(chunk_words))
+            start_char = chunk_words[0][0]
+            end_char = chunk_words[-1][1]
             
-            if end_idx == len(words):
+            chunks.append({
+                "text": text[start_char:end_char],
+                "start_char": start_char,
+                "end_char": end_char
+            })
+            
+            if end_idx == len(word_spans):
                 break
                 
             i += (chunk_size - overlap)

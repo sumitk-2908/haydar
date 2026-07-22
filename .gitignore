@@ -37,3 +37,12 @@ htmlcov/
 
 # Model cache
 models/
+
+# Downloaded binaries
+src/haydar/bin/
+
+# Claude Code personal (per-developer) settings
+.claude/settings.local.json
+
+# Scratch / reference material (not part of the project)
+scratch/

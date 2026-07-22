@@ -9,21 +9,70 @@ from pathlib import Path
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-from haydar.config import HaydarConfig, DB_DIR
+from haydar.config import HaydarConfig, DB_DIR, MODELS_DIR
+
+
+class VectorStoreError(Exception):
+    """Raised when the vector store cannot be initialized (missing model,
+    corrupt database, etc.). Callers are expected to catch this and surface a
+    friendly message rather than letting the process die."""
+
+    def __init__(self, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.hint = hint
 
 
 class VectorStore:
-    def __init__(self, config: HaydarConfig):
+    def __init__(self, config: HaydarConfig, allow_download: bool = False):
         self.config = config
-        self.client = chromadb.PersistentClient(path=str(DB_DIR))
-        self.embedding_function = SentenceTransformerEmbeddingFunction(
-            model_name=config.embedding_model
-        )
-        self.collection = self.client.get_or_create_collection(
-            name="haydar_files",
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
+
+        # Ensure sentence-transformers caches models in our directory. Done here
+        # (not at import time) so importing this module has no global side effects.
+        os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(MODELS_DIR)
+
+        # Check for model existence if download not allowed
+        if not allow_download:
+            if not list(MODELS_DIR.glob("models--*")):
+                raise VectorStoreError(
+                    f"Model not found at {MODELS_DIR}.",
+                    hint="Run `haydar init` to download it.",
+                )
+
+        try:
+            self.client = chromadb.PersistentClient(path=str(DB_DIR))
+        except Exception as exc:
+            # Catch ChromaDB corruption errors (e.g. sqlite3.DatabaseError)
+            raise VectorStoreError(
+                f"Database corruption detected in {DB_DIR}: {exc}",
+                hint="Please run `haydar reindex` to recreate your database.",
+            ) from exc
+
+        try:
+            self.embedding_function = SentenceTransformerEmbeddingFunction(
+                model_name=config.embedding_model
+            )
+        except Exception as exc:
+            hint = (
+                "Please check your internet connection and try again."
+                if allow_download
+                else "Run `haydar init` to download the embedding model."
+            )
+            raise VectorStoreError(
+                f"Failed to load embedding model '{config.embedding_model}': {exc}",
+                hint=hint,
+            ) from exc
+
+        try:
+            self.collection = self.client.get_or_create_collection(
+                name="haydar_files",
+                embedding_function=self.embedding_function,
+                metadata={"hnsw:space": "cosine"}
+            )
+        except Exception as exc:
+            raise VectorStoreError(
+                f"Failed to initialize collection: {exc}",
+                hint="Please run `haydar reindex` to recreate your database.",
+            ) from exc
 
     def add_documents(self, ids: list[str], documents: list[str], metadatas: list[dict]) -> None:
         """Add documents to the collection."""
@@ -43,6 +92,23 @@ class VectorStore:
         )
         if results and results.get("ids"):
             self.collection.delete(ids=results["ids"])
+
+    def delete_by_filepaths(self, filepaths: list[str]) -> None:
+        """Delete all chunks belonging to a list of file paths."""
+        if not filepaths:
+            return
+            
+        # ChromaDB 'in' operator has limits, but we can do it via get+delete
+        # To handle potentially large lists, we fetch and delete in batches of 100
+        batch_size = 100
+        for i in range(0, len(filepaths), batch_size):
+            batch = filepaths[i:i + batch_size]
+            results = self.collection.get(
+                where={"file_path": {"$in": batch}},
+                include=[]
+            )
+            if results and results.get("ids"):
+                self.collection.delete(ids=results["ids"])
 
     def query(self, query_text: str, n_results: int = 10) -> list[dict]:
         """Semantic search."""
