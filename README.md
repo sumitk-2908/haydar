@@ -8,7 +8,7 @@ Find any file by *what it contains*, not what it's named. Powered by AI embeddin
 
 ## Features
 
-- 🔍 **Semantic search** — search by meaning, not just keywords
+- 🔍 **Semantic search** — search by meaning, not just keywords, with an optional exact-match keyword mode
 - 📄 **All file types** — PDFs, DOCX, TXT, code files, images (OCR)
 - 🏠 **100% local** — everything runs on your device, no data leaves your machine
 - ⚡ **Fast** — sub-second search across thousands of files
@@ -37,6 +37,19 @@ haydar search "quarterly budget report"
 pip install haydar
 ```
 
+### Standalone Windows EXE
+
+Prebuilt executables are attached to each [GitHub Release](https://github.com/haydar-search/haydar/releases):
+
+- `haydar.exe` — the floating search UI (no console window).
+- `haydar-cli.exe` — the full command-line interface.
+
+Verify the download against its `.sha256` file, then run `haydar-cli.exe init` once to set up your index.
+
+> **Note:** The EXEs are not code-signed yet, so Windows SmartScreen may show a
+> "Windows protected your PC" warning on first launch. Click **More info →
+> Run anyway**. Verifying the SHA-256 checksum confirms the download is intact.
+
 ### Optional: Image OCR Support
 
 To search inside images (PNG, JPG, TIFF), install the OCR extras:
@@ -56,9 +69,10 @@ haydar init
 ```
 
 This will:
-1. Ask you which folders to index (defaults: Documents, Desktop, Downloads)
-2. Download the embedding model (~80MB, first run only, requires internet)
-3. Index all supported files in your selected folders
+1. Select folders to index (defaults: Documents, Desktop, Downloads — override with `--folders`)
+2. Download the embedding model (~80MB, first run only, **requires internet**)
+3. Download the ripgrep binary for keyword search (verified by SHA-256)
+4. Index all supported files in your selected folders
 
 ### Search
 
@@ -66,6 +80,7 @@ This will:
 ```bash
 haydar search "machine learning research notes"
 haydar search "invoice from march" --limit 5
+haydar search "TODO" --mode keyword     # exact-match keyword search (ripgrep)
 ```
 
 **Floating UI:**
@@ -98,7 +113,7 @@ haydar reindex                  # force full re-index
 2. **Chunking** — Documents are split into ~500-word chunks with overlap
 3. **Embedding** — Each chunk is converted to a 384-dimensional vector using `all-MiniLM-L6-v2`
 4. **Storage** — Vectors are stored locally in ChromaDB at `~/.haydar/db/`
-5. **Search** — Your query is embedded and matched against all chunks using hybrid semantic + keyword search
+5. **Search** — Your query is embedded and matched against all chunks by cosine similarity (semantic mode). A separate keyword mode uses ripgrep for fast exact-text matches.
 
 ## Supported File Types
 
@@ -121,6 +136,12 @@ Config is stored at `~/.haydar/config.json`. You can edit it directly or use `ha
 | `chunk_overlap` | `50` | Overlap between chunks |
 | Size limits | 10MB text, 100MB docs | Per-type file size limits |
 
+## Troubleshooting
+
+- **Model download / offline failure:** If you see `Model not found at ~/.haydar/models/`, ensure you are connected to the internet and run `haydar init` to download the embedding model.
+- **Empty search results:** Check if your folders are indexed correctly using `haydar status`. Try running `haydar reindex`. Ensure the files are not excluded by `config.json`.
+- **Hotkey / System tray failure:** If the `Ctrl+Space` hotkey doesn't work, ensure `haydar watch` is running in the background. If the system tray icon doesn't appear, you may be missing PySide6 plugins. Reinstall using `pip install --force-reinstall PySide6`.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -129,6 +150,7 @@ Config is stored at `~/.haydar/config.json`. You can edit it directly or use `ha
 | Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) |
 | Vector DB | ChromaDB (fully local) |
 | Text extraction | pypdf, python-docx, chardet |
+| Keyword search | ripgrep |
 | OCR | pytesseract (optional) |
 | File watching | watchdog |
 | Desktop UI | PySide6 |

@@ -21,18 +21,27 @@ HAYDAR_DIR = Path.home() / ".haydar"
 CONFIG_PATH = HAYDAR_DIR / "config.json"
 DB_DIR = HAYDAR_DIR / "db"
 LOG_DIR = HAYDAR_DIR / "logs"
+MODELS_DIR = HAYDAR_DIR / "models"
+CACHE_DIR = HAYDAR_DIR / "cache"
+RIPGREP_DIR = HAYDAR_DIR / "bin"
 INDEX_LOCK = HAYDAR_DIR / ".indexing.lock"
+
+# DB Schema Version (increment when changing schema/chunk sizes that require reindex)
+CURRENT_SCHEMA_VERSION = 1
 
 
 def _default_folders() -> list[str]:
-    """Return default folders to index (user home subdirectories that exist)."""
+    """Return the user's common document folders that exist.
+
+    Defaults to Documents, Desktop, and Downloads. Falls back to the current
+    working directory if none of those exist.
+    """
     home = Path.home()
-    candidates = [
-        home / "Documents",
-        home / "Desktop",
-        home / "Downloads",
-    ]
-    return [str(p) for p in candidates if p.exists()]
+    candidates = [home / "Documents", home / "Desktop", home / "Downloads"]
+    existing = [str(p) for p in candidates if p.is_dir()]
+    if existing:
+        return existing
+    return [str(Path.cwd())]
 
 
 # ── File type size limits (bytes) ──────────────────────────────────────────────
@@ -76,6 +85,17 @@ ALL_INDEXABLE_EXTENSIONS: set[str] = (
 
 # ── Excluded patterns ─────────────────────────────────────────────────────────
 
+ROOT_ANCHORED_EXCLUSIONS: set[str] = {
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "$recycle.bin",
+    "system volume information",
+    "recovery",
+    "perflogs",
+}
+
 DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     "node_modules",
     ".git",
@@ -91,8 +111,26 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     ".pytest_cache",
     "*.egg-info",
     ".haydar",
-    "$RECYCLE.BIN",
-    "System Volume Information",
+    ".svelte-kit",
+    "target",
+    "out",
+    ".next",
+    "vendor",
+    ".idea",
+    ".vscode",
+    "appdata",
+    "temp",
+    "tmp",
+    "hiberfil.sys",
+    "pagefile.sys",
+    "swapfile.sys",
+    ".cache",
+    ".ruff_cache",
+    "coverage",
+    "htmlcov",
+    ".npm",
+    ".DS_Store",
+    "Thumbs.db",
 ]
 
 
@@ -122,6 +160,9 @@ class HaydarConfig:
     chunk_size: int = 500  # tokens (approximate by words)
     chunk_overlap: int = 50
 
+    # Batching settings for embedding
+    embedding_batch_size: int = 1000
+
     # Hotkey
     hotkey: str = "<ctrl>+<space>"  # pynput format
 
@@ -130,6 +171,9 @@ class HaydarConfig:
 
     # Initialized flag
     initialized: bool = False
+    
+    # DB Schema Version
+    schema_version: int = CURRENT_SCHEMA_VERSION
 
     def save(self) -> None:
         """Persist config to disk."""
@@ -160,6 +204,9 @@ class HaydarConfig:
         HAYDAR_DIR.mkdir(parents=True, exist_ok=True)
         DB_DIR.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        RIPGREP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_size_category(extension: str) -> str:
@@ -174,12 +221,58 @@ def get_size_category(extension: str) -> str:
 def is_excluded(path: Path, excluded_patterns: list[str]) -> bool:
     """Check if a path should be excluded from indexing."""
     parts = path.parts
+    
+    # Check root-anchored exclusions (parts[1] is the folder immediately inside the drive root)
+    if len(parts) > 1:
+        if parts[1].lower() in ROOT_ANCHORED_EXCLUSIONS:
+            return True
+            
+    # Check name-based exclusions
     for pattern in excluded_patterns:
         for part in parts:
             if pattern.startswith("*"):
                 # Glob-style suffix match (e.g., *.egg-info)
-                if part.endswith(pattern[1:]):
+                if part.lower().endswith(pattern[1:].lower()):
                     return True
-            elif part == pattern:
-                return True
+            else:
+                # Exact match
+                if part.lower() == pattern.lower():
+                    return True
     return False
+
+class HaydarConfigError(Exception):
+    """Exception raised for configuration or missing binary errors."""
+    pass
+
+def get_rg_path() -> Path:
+    """
+    Locate the ripgrep binary.
+    Checks (1) the PyInstaller bundle, (2) the user data dir (~/.haydar/bin,
+    where `haydar init` fetches it for pip installs), then (3) the local dev
+    path next to this file. Raises HaydarConfigError if not found.
+    """
+    import sys
+    import platform
+
+    executable_name = "rg.exe" if platform.system().lower() == "windows" else "rg"
+
+    # 1. PyInstaller bundled path
+    if hasattr(sys, '_MEIPASS'):
+        bundle_path = Path(sys._MEIPASS) / "haydar" / "bin" / executable_name
+        if bundle_path.exists():
+            return bundle_path
+
+    # 2. User data dir (populated by `haydar init` on pip installs)
+    user_path = RIPGREP_DIR / executable_name
+    if user_path.exists():
+        return user_path
+
+    # 3. Local development path (assuming this file is at src/haydar/config.py)
+    dev_path = Path(__file__).resolve().parent / "bin" / executable_name
+    if dev_path.exists():
+        return dev_path
+
+    raise HaydarConfigError(
+        f"Could not find ripgrep binary '{executable_name}'.\n"
+        "Run 'haydar init' to download it, or execute 'python scripts/pull-rg.py'."
+    )
