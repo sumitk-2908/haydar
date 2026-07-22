@@ -132,7 +132,7 @@ class HybridSearch:
                         
                         try:
                             mod_time = os.path.getmtime(file_path)
-                        except:
+                        except OSError:
                             mod_time = 0.0
                             
                         snippet = re.sub(r'\s+', ' ', lines).strip()

@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import concurrent.futures
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Any
@@ -33,6 +34,40 @@ class IndexingEngine:
         self.config = config
         self.store = VectorStore(config, allow_download=allow_download)
         self.cache = FileCache()
+
+    @contextmanager
+    def _acquire_index_lock(self, *, blocking: bool):
+        """Process-exclusive lock around every ChromaDB write path.
+
+        A single lock file (``INDEX_LOCK``) serialises `index_all`, `index_file`
+        and `remove_file` so a full reindex can never interleave upserts with the
+        watcher's single-file updates (and two full indexes can't run at once).
+
+        ``blocking=False`` (full index): raise ``RuntimeError`` immediately if the
+        lock is held, so `reindex`/`init` fail fast with a friendly message.
+        ``blocking=True`` (watcher single-file ops): wait for the holder so the
+        update serialises instead of being dropped. Windows-only (``msvcrt``),
+        consistent with the rest of the app.
+        """
+        import msvcrt
+        from haydar.config import INDEX_LOCK
+
+        INDEX_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(INDEX_LOCK, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            msvcrt.locking(lock_fd, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            os.close(lock_fd)
+            raise RuntimeError("Indexing already in progress.") from exc
+
+        try:
+            yield
+        finally:
+            try:
+                msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            os.close(lock_fd)
 
     def _extract_worker(self, filepath: Path, config: HaydarConfig, force: bool) -> ExtractionResult:
         try:
@@ -63,6 +98,10 @@ class IndexingEngine:
 
     def index_all(self, force: bool = False) -> dict:
         """Index all files using a producer-consumer pipeline with batching."""
+        with self._acquire_index_lock(blocking=False):
+            return self._index_all_internal(force)
+
+    def _index_all_internal(self, force: bool = False) -> dict:
         stats = {
             "files_indexed": 0,
             "chunks_stored": 0,
@@ -159,7 +198,6 @@ class IndexingEngine:
                 batch_deletions.clear()
                 cache_updates.clear()
 
-        import multiprocessing
         max_workers = min(32, (os.cpu_count() or 1) + 4)
         submission_window = max_workers * 4
 
@@ -263,14 +301,12 @@ class IndexingEngine:
             chunks = self._chunk_text(extracted.text, self.config.chunk_size, self.config.chunk_overlap)
             if not chunks:
                 return False
-                
-            self.store.delete_by_filepath(str(filepath.absolute()))
-            
+
             ids = []
             documents = []
             metadatas = []
             mod_time = os.path.getmtime(filepath)
-            
+
             path_hash = hashlib.md5(str(filepath.absolute()).encode('utf-8')).hexdigest()
             for i, chunk_info in enumerate(chunks):
                 ids.append(f"{path_hash}_{i}")
@@ -285,16 +321,17 @@ class IndexingEngine:
                     "modified_time": mod_time,
                     "filename": filepath.name
                 })
-                
+
             batch_size = 100
-            for i in range(0, len(ids), batch_size):
-                self.store.add_documents(
-                    ids=ids[i:i + batch_size],
-                    documents=documents[i:i + batch_size],
-                    metadatas=metadatas[i:i + batch_size]
-                )
-                
-            self.cache.set(str(filepath.absolute()), mod_time, filepath.stat().st_size, file_hash, len(chunks))
+            with self._acquire_index_lock(blocking=True):
+                self.store.delete_by_filepath(str(filepath.absolute()))
+                for i in range(0, len(ids), batch_size):
+                    self.store.add_documents(
+                        ids=ids[i:i + batch_size],
+                        documents=documents[i:i + batch_size],
+                        metadatas=metadatas[i:i + batch_size]
+                    )
+                self.cache.set(str(filepath.absolute()), mod_time, filepath.stat().st_size, file_hash, len(chunks))
             return True
         except Exception:
             return False
@@ -302,8 +339,12 @@ class IndexingEngine:
     def remove_file(self, filepath: Path) -> None:
         """Remove a file from the index."""
         abs_path = str(filepath.absolute())
-        self.store.delete_by_filepath(abs_path)
-        self.cache.remove(abs_path)
+        try:
+            with self._acquire_index_lock(blocking=True):
+                self.store.delete_by_filepath(abs_path)
+                self.cache.remove(abs_path)
+        except RuntimeError:
+            logger.warning("Deferred removal of %s: indexing busy.", abs_path)
 
     def close(self) -> None:
         """Release resources (the SQLite cache connection)."""

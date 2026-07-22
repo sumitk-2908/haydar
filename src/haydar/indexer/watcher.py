@@ -156,6 +156,7 @@ class FileWatcher:
             observer.stop()
             observer.join()
             logger.info("Watcher stopped.")
+            self.close()
 
     def stop(self) -> None:
         """Stop a non-blocking observer started via start(blocking=False)."""
@@ -165,6 +166,12 @@ class FileWatcher:
             observer.join()
             self._observer = None
             logger.info("Watcher stopped.")
+        self.close()
+
+    def close(self) -> None:
+        """Release resources."""
+        if hasattr(self, 'engine') and hasattr(self.engine, 'close'):
+            self.engine.close()
 
 
 def install_autostart() -> None:
@@ -174,7 +181,18 @@ def install_autostart() -> None:
     
     bat_path = startup_dir / "haydar_watcher.bat"
     
-    content = "@echo off\npythonw -m haydar watch\n"
+    import sys
+    if getattr(sys, "frozen", False):
+        exe_path = Path(sys.executable)
+        if exe_path.name.lower() == "haydar.exe":
+            cli_path = exe_path.with_name("haydar-cli.exe")
+            command = f'"{cli_path if cli_path.exists() else exe_path}" watch'
+        else:
+            command = f'"{exe_path}" watch'
+    else:
+        command = "pythonw -m haydar watch"
+        
+    content = f"@echo off\n{command}\n"
     bat_path.write_text(content, encoding="utf-8")
     
     logger.info(f"Autostart script installed successfully at: {bat_path}")
