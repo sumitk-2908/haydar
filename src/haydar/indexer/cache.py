@@ -1,7 +1,8 @@
-import sqlite3
+import builtins
+import contextlib
 import logging
-from pathlib import Path
-from typing import Optional, Dict, Any, Set
+import sqlite3
+from typing import Any
 
 from haydar.config import DB_DIR
 
@@ -44,10 +45,8 @@ class FileCache:
                 self._conn.close()
                 self._conn = None
             if self.db_path.exists():
-                try:
+                with contextlib.suppress(OSError):
                     self.db_path.unlink()
-                except OSError:
-                    pass
             # Try again
             conn = self._get_conn()
             conn.execute('''
@@ -61,7 +60,7 @@ class FileCache:
             ''')
             conn.commit()
 
-    def get(self, filepath: str) -> Optional[Dict[str, Any]]:
+    def get(self, filepath: str) -> dict[str, Any] | None:
         """Get cached info for a file."""
         try:
             cur = self._get_conn().cursor()
@@ -105,7 +104,7 @@ class FileCache:
         except sqlite3.Error as e:
             logger.debug(f"Cache bulk delete error: {e}")
 
-    def get_all_filepaths(self) -> Set[str]:
+    def get_all_filepaths(self) -> builtins.set[str]:
         """Return all filepaths in the cache."""
         try:
             cur = self._get_conn().cursor()

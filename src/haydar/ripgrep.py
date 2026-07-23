@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import platform
 import shutil
+import sys
 import tarfile
 import urllib.request
 import zipfile
@@ -114,7 +115,12 @@ def _extract(archive_path: Path, dest_dir: Path, system: str) -> Path:
             for member in tar.getmembers():
                 if member.name.endswith(exe) and not member.isdir():
                     member.name = exe
-                    tar.extract(member, dest_dir)
+                    # `filter="data"` (3.12+) rejects unsafe tar members as
+                    # defense-in-depth; the archive is already hash-pinned.
+                    if sys.version_info >= (3, 12):
+                        tar.extract(member, dest_dir, filter="data")
+                    else:
+                        tar.extract(member, dest_dir)
                     extracted = dest_dir / exe
                     if system != "windows":
                         extracted.chmod(0o755)

@@ -1,5 +1,5 @@
-import re
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +23,7 @@ class SearchResult:
 class HybridSearch:
     def __init__(self, config: HaydarConfig):
         self.config = config
-        self._store = None
+        self._store: VectorStore | None = None
 
     @property
     def store(self) -> VectorStore:
@@ -55,14 +55,15 @@ class HybridSearch:
                 yield []
         elif mode == "keyword":
             yield from self._stream_ripgrep(query, limit, cancel_event, worker)
-            
+
     def _stream_ripgrep(self, query: str, limit: int, cancel_event, worker):
-        import subprocess
         import json
-        import time
         import os
-        from haydar.config import get_rg_path, HaydarConfigError
-        
+        import subprocess
+        import time
+
+        from haydar.config import HaydarConfigError, get_rg_path
+
         try:
             rg_path = get_rg_path()
         except HaydarConfigError as e:
@@ -70,7 +71,7 @@ class HybridSearch:
             if worker and hasattr(worker, 'error_occurred'):
                 worker.error_occurred.emit(str(e))
             return
-            
+
         args = [
             str(rg_path),
             "--json",
@@ -79,10 +80,10 @@ class HybridSearch:
             "--max-count", str(limit * 2),
             query
         ]
-        
+
         for folder in self.config.folders:
             args.append(folder)
-            
+
         try:
             process = subprocess.Popen(
                 args,
@@ -93,10 +94,10 @@ class HybridSearch:
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            
+
             if worker:
                 worker.rg_process = process
-                
+
             skipped = []
             import threading
             def read_stderr():
@@ -105,40 +106,43 @@ class HybridSearch:
                         line = line.strip()
                         if line:
                             skipped.append(line)
-            
+
             stderr_thread = threading.Thread(target=read_stderr, daemon=True)
             stderr_thread.start()
-                
+
             results = []
             last_flush = time.time()
-            
+
+            if process.stdout is None:
+                return
+
             for line in process.stdout:
                 if cancel_event and cancel_event.is_set():
                     break
-                    
+
                 if not line.strip():
                     continue
-                    
+
                 try:
                     data = json.loads(line)
                     if data.get("type") == "match":
                         match = data["data"]
                         file_path = match["path"]["text"]
                         lines = match["lines"]["text"]
-                        
+
                         filename = Path(file_path).name
                         folder = str(Path(file_path).parent)
                         file_type = Path(file_path).suffix
-                        
+
                         try:
                             mod_time = os.path.getmtime(file_path)
                         except OSError:
                             mod_time = 0.0
-                            
+
                         snippet = re.sub(r'\s+', ' ', lines).strip()
                         if len(snippet) > 200:
                             snippet = snippet[:200] + "..."
-                            
+
                         # Avoid duplicates
                         if not any(r.file_path == file_path for r in results):
                             results.append(SearchResult(
@@ -148,25 +152,24 @@ class HybridSearch:
                                 file_type=file_type,
                                 snippet=snippet,
                                 score=1.0,
-                                modified_time=float(mod_time)
+                                modified_time=mod_time
                             ))
                 except json.JSONDecodeError:
                     pass
-                    
+
                 now = time.time()
-                if len(results) % 25 == 0 or (now - last_flush) > 0.150:
-                    if results:
-                        yield list(results)[:limit]
-                        last_flush = now
-                        
+                if (len(results) % 25 == 0 or (now - last_flush) > 0.150) and results:
+                    yield list(results)[:limit]
+                    last_flush = now
+
             if results and not (cancel_event and cancel_event.is_set()):
                 yield list(results)[:limit]
-                
+
             process.wait()
             stderr_thread.join(timeout=1.0)
             if skipped and worker and hasattr(worker, 'skipped_files'):
                 worker.skipped_files.emit(skipped)
-                
+
         except Exception as e:
             logger.error(f"Ripgrep execution failed: {e}")
 
@@ -196,7 +199,7 @@ class HybridSearch:
             if distance is None:
                 distance = 0.0
             score = max(0.0, min(1.0, 1.0 - distance))
-            
+
             if r["id"] in combined:
                 combined[r["id"]]["_score"] = min(1.0, combined[r["id"]]["_score"] * 1.1)
             else:
@@ -225,7 +228,7 @@ class HybridSearch:
             file_type = meta.get("file_type", Path(file_path).suffix)
             modified_time = meta.get("modified_time", 0.0)
             document = r.get("document", "")
-            
+
             start_char = meta.get("start_char")
             end_char = meta.get("end_char")
 
@@ -244,24 +247,24 @@ class HybridSearch:
         return final_results
 
     @staticmethod
-    def _extract_snippet(document: str, query: str, max_length: int = 200, file_path: str = None, start_char: int = None, end_char: int = None) -> str:
+    def _extract_snippet(document: str, query: str, max_length: int = 200, file_path: str | None = None, start_char: int | None = None, end_char: int | None = None) -> str:
         snippet_text = document
-        
+
         if file_path and start_char is not None and end_char is not None:
             try:
                 padding = max_length // 2
                 read_start = max(0, start_char - padding)
                 read_end = end_char + padding
-                
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+
+                with open(file_path, encoding="utf-8", errors="ignore") as f:
                     f.seek(read_start)
                     context_text = f.read(read_end - read_start)
-                
+
                 if context_text.strip():
                     snippet_text = context_text
             except Exception:
                 pass
-                
+
         # Clean up whitespace
         snippet_text = re.sub(r'\s+', ' ', snippet_text).strip()
         if not snippet_text:
@@ -275,7 +278,7 @@ class HybridSearch:
             if idx != -1:
                 start = max(0, idx - (max_length // 2))
                 end = min(len(snippet_text), start + max_length)
-                
+
                 snippet = snippet_text[start:end].strip()
                 if start > 0:
                     snippet = "..." + snippet

@@ -12,24 +12,20 @@ Commands:
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich import print as rprint
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from haydar import __version__
 from haydar.config import (
+    DB_DIR,
+    HAYDAR_DIR,
     HaydarConfig,
     _default_folders,
-    HAYDAR_DIR,
-    DB_DIR,
-    ALL_INDEXABLE_EXTENSIONS,
 )
 
 console = Console()
@@ -48,8 +44,8 @@ def _banner() -> None:
     rprint(
         Panel.fit(
             "[bold cyan]Haydar[/bold cyan]  "
-            "[dim]v{}[/dim]\n"
-            "[dim]Fast, local semantic file search[/dim]".format(__version__),
+            f"[dim]v{__version__}[/dim]\n"
+            "[dim]Fast, local semantic file search[/dim]",
             border_style="cyan",
         )
     )
@@ -60,7 +56,7 @@ def _banner() -> None:
 
 @app.command()
 def init(
-    folders: Optional[list[str]] = typer.Option(
+    folders: list[str] | None = typer.Option(
         None,
         "--folders", "-f",
         help="Folders to index. If not specified, uses defaults with interactive confirmation.",
@@ -109,15 +105,15 @@ def init(
     config.ensure_dirs()
     config.save()
 
-    rprint("[green]>[/green] Config saved to [dim]{0}[/dim]".format(HAYDAR_DIR))
-    rprint("[green]>[/green] Database at [dim]{0}[/dim]\n".format(DB_DIR))
+    rprint(f"[green]>[/green] Config saved to [dim]{HAYDAR_DIR}[/dim]")
+    rprint(f"[green]>[/green] Database at [dim]{DB_DIR}[/dim]\n")
 
     _ensure_ripgrep()
 
     rprint("[bold]Starting initial index...[/bold]\n")
     try:
         from haydar.indexer.engine import IndexingEngine
-        
+
         rprint("[dim]Downloading embedding model (~80 MB); first run only, this may take a minute...[/dim]")
 
         with IndexingEngine(config, allow_download=True) as engine:
@@ -142,7 +138,7 @@ def init(
 
 @app.command()
 def search(
-    query: Optional[str] = typer.Argument(
+    query: str | None = typer.Argument(
         None,
         help="Search query. If omitted, opens the floating search UI.",
     ),
@@ -260,7 +256,7 @@ def watch(
             # UI dependencies not installed, run blocking watcher
             rprint("[dim]UI dependencies not found. Watcher running in blocking mode.[/dim]")
             watcher.start(blocking=True)
-            
+
     except KeyboardInterrupt:
         rprint("\n[yellow]Watcher stopped.[/yellow]")
     except Exception as exc:
@@ -288,11 +284,11 @@ def status() -> None:
     except Exception as exc:
         _fail(exc)
 
-    rprint(f"\n[bold]Config:[/bold]")
+    rprint("\n[bold]Config:[/bold]")
     rprint(f"  [dim]Model:[/dim]     {config.embedding_model}")
     rprint(f"  [dim]Hotkey:[/dim]    {config.hotkey}")
     rprint(f"  [dim]Debounce:[/dim]  {config.watcher_debounce_seconds}s")
-    rprint(f"\n[bold]Folders:[/bold]")
+    rprint("\n[bold]Folders:[/bold]")
     for folder in config.folders:
         rprint(f"  [cyan]>[/cyan]  {folder}")
 
@@ -302,22 +298,22 @@ def status() -> None:
 
 @app.command(name="config")
 def show_config(
-    add_folder: Optional[str] = typer.Option(
+    add_folder: str | None = typer.Option(
         None,
         "--add-folder",
         help="Add a folder to the index list.",
     ),
-    remove_folder: Optional[str] = typer.Option(
+    remove_folder: str | None = typer.Option(
         None,
         "--remove-folder",
         help="Remove a folder from the index list.",
     ),
-    set_hotkey: Optional[str] = typer.Option(
+    set_hotkey: str | None = typer.Option(
         None,
         "--set-hotkey",
         help="Set the global hotkey (pynput format, e.g., '<ctrl>+<space>').",
     ),
-    set_model: Optional[str] = typer.Option(
+    set_model: str | None = typer.Option(
         None,
         "--set-model",
         help="Set the embedding model name.",
@@ -376,10 +372,10 @@ def show_config(
         rprint(f"\n[bold]Folders ({len(config.folders)}):[/bold]")
         for folder in config.folders:
             rprint(f"  [cyan]>[/cyan]  {folder}")
-        rprint(f"\n[bold]Size limits:[/bold]")
+        rprint("\n[bold]Size limits:[/bold]")
         for category, limit in config.size_limits.items():
             rprint(f"  [dim]{category}:[/dim]  {limit // (1024 * 1024)} MB")
-        rprint(f"\n[bold]Excluded patterns:[/bold]")
+        rprint("\n[bold]Excluded patterns:[/bold]")
         rprint(f"  [dim]{', '.join(config.excluded_patterns[:8])}...[/dim]")
 
 
@@ -435,37 +431,37 @@ def uninstall(
     """Uninstall Haydar: remove data, config, and autostart script."""
     import shutil
     import time
-    
+
     startup_dir = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
     bat_path = startup_dir / "haydar_watcher.bat"
-    
+
     rprint("[bold]Uninstalling Haydar...[/bold]\n")
-    
+
     if dry_run:
         rprint("[yellow]DRY RUN - No files will be deleted.[/yellow]")
         if HAYDAR_DIR.exists():
             rprint(f"Would backup and delete: [cyan]{HAYDAR_DIR}[/cyan]")
         else:
             rprint(f"Would delete: [cyan]{HAYDAR_DIR}[/cyan] (Not found)")
-            
+
         if bat_path.exists():
             rprint(f"Would delete: [cyan]{bat_path}[/cyan]")
         else:
             rprint(f"Would delete: [cyan]{bat_path}[/cyan] (Not found)")
         raise typer.Exit(0)
-        
+
     if not yes:
         confirm = typer.confirm("This will permanently delete your Haydar index and configuration. A backup will be saved to your Desktop. Continue?", default=False)
         if not confirm:
             raise typer.Exit(0)
-            
+
     # Backup
     if HAYDAR_DIR.exists():
         timestamp = int(time.time())
         desktop = Path.home() / "Desktop"
         backup_dir = desktop if desktop.exists() else Path.home()
         backup_path = backup_dir / f"haydar_backup_{timestamp}"
-        
+
         rprint(f"Creating backup of {HAYDAR_DIR}...")
         try:
             shutil.make_archive(str(backup_path), 'zip', str(HAYDAR_DIR))
@@ -474,14 +470,14 @@ def uninstall(
             rprint(f"[red]x[/red] Failed to create backup: {e}")
             rprint("Aborting uninstall to prevent data loss.")
             raise typer.Exit(1)
-            
+
         # Delete ~/.haydar
         try:
             shutil.rmtree(HAYDAR_DIR)
             rprint(f"[green]+[/green] Deleted {HAYDAR_DIR}")
         except Exception as e:
             rprint(f"[red]x[/red] Failed to delete {HAYDAR_DIR}: {e}")
-            
+
     # Delete autostart
     if bat_path.exists():
         try:
@@ -489,7 +485,7 @@ def uninstall(
             rprint(f"[green]+[/green] Removed autostart script {bat_path}")
         except Exception as e:
             rprint(f"[red]x[/red] Failed to remove autostart script: {e}")
-            
+
     rprint("\n[green bold]+ Haydar uninstalled successfully.[/green bold]")
 
 
@@ -534,7 +530,7 @@ def _ensure_ripgrep() -> None:
     Failure is non-fatal: keyword search will be unavailable but semantic
     search still works, so we warn rather than abort init.
     """
-    from haydar.config import get_rg_path, HaydarConfigError, RIPGREP_DIR
+    from haydar.config import RIPGREP_DIR, HaydarConfigError, get_rg_path
 
     try:
         get_rg_path()
@@ -579,7 +575,7 @@ def _check_initialized(config: HaydarConfig) -> None:
             "[dim]Run [bold]haydar init[/bold] first to set up your index.[/dim]"
         )
         raise typer.Exit(1)
-        
+
     from haydar.config import CURRENT_SCHEMA_VERSION
     if config.schema_version != CURRENT_SCHEMA_VERSION:
         rprint(

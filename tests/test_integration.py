@@ -1,9 +1,10 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
-from pathlib import Path
 
 from haydar.config import HaydarConfig
 from haydar.indexer.engine import IndexingEngine
+
 
 @pytest.fixture
 def temp_tree(tmp_path):
@@ -17,7 +18,7 @@ def temp_tree(tmp_path):
 def test_integration_index_and_invalidate(MockStore, tmp_haydar, temp_tree):
     mock_store_instance = MagicMock()
     MockStore.return_value = mock_store_instance
-    
+
     config = HaydarConfig()
     config.folders = [str(temp_tree)]
     # pytest's tmp_path lives under ...\AppData\Local\Temp\..., and both "appdata"
@@ -31,8 +32,8 @@ def test_integration_index_and_invalidate(MockStore, tmp_haydar, temp_tree):
     engine.index_all()
 
     # Assert chunks landed in the store
-    assert mock_store_instance.add_documents.call_count > 0
     first_add_count = mock_store_instance.add_documents.call_count
+    assert first_add_count > 0
 
     # 2. Second run, should skip unchanged files
     mock_store_instance.add_documents.reset_mock()

@@ -1,33 +1,40 @@
 import os
-import sys
 import signal
+import sys
+import threading
+
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLineEdit, 
-    QPushButton, QScrollArea, QLabel, QGraphicsDropShadowEffect
+    QApplication,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QObject, QPoint
-from PySide6.QtGui import QPainter, QBrush, QColor, QFont, QPen
 
 from haydar.config import HaydarConfig
 from haydar.search.hybrid import HybridSearch, SearchResult
-from haydar.ui.results import ResultsList
 from haydar.ui.hotkey import HotkeyListener
+from haydar.ui.results import ResultsList
 
-
-import threading
-import subprocess
 
 class SearchWorker(QObject):
     finished = Signal(list)
     skipped_files = Signal(list)
     error_occurred = Signal(str)
-    
+
     def __init__(self, search_engine: HybridSearch):
         super().__init__()
         self.search_engine = search_engine
         self.cancel_event = threading.Event()
         self.rg_process = None
-        
+
     def cancel(self):
         self.cancel_event.set()
         if self.rg_process:
@@ -40,7 +47,7 @@ class SearchWorker(QObject):
                 import logging
                 logging.getLogger(__name__).warning(f"Error killing ripgrep: {e}")
             self.rg_process = None
-        
+
     def do_search(self, query: str, mode: str):
         self.cancel_event.clear()
         if not query.strip():
@@ -63,17 +70,17 @@ class SearchWorker(QObject):
 class SearchWindow(QWidget):
     search_requested = Signal(str, str)
     toggle_requested = Signal()
-    
+
     def __init__(self, config: HaydarConfig):
         super().__init__()
         self.config = config
         self.toggle_requested.connect(self.toggle)
-        
+
         # Setup UI properties
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFixedSize(700, 80)
-        
+
         # Search engine & threading
         self.search_mode = "semantic"  # default mode
         self.engine_error: str | None = None
@@ -99,22 +106,22 @@ class SearchWindow(QWidget):
             self.search_worker.skipped_files.connect(self.on_skipped_files)
             self.search_worker.error_occurred.connect(self.on_search_error)
             self.search_thread.start()
-        
+
         self.setup_ui()
-        
+
         # Debounce timer
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(300)
         self.search_timer.timeout.connect(self._trigger_search)
-        
+
         # Drag state
         self.drag_pos = None
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(15, 15, 15, 15)
-        
+
         # Container
         self.container = QFrame()
         # Transparent background so it doesn't cover the window's paintEvent
@@ -124,22 +131,22 @@ class SearchWindow(QWidget):
                 border: none;
             }
         """)
-        
+
         shadow = QGraphicsDropShadowEffect()
         shadow.setBlurRadius(30)
         shadow.setColor(QColor(0, 0, 0, 153)) # 60% opacity
         shadow.setOffset(0, 10)
         self.container.setGraphicsEffect(shadow)
-        
+
         container_layout = QVBoxLayout(self.container)
         container_layout.setContentsMargins(16, 16, 16, 16)
         container_layout.setSpacing(12)
-        
+
         # Search Input & Toggle
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
         search_layout.setSpacing(10)
-        
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 Search your files...")
         self.search_input.setStyleSheet("""
@@ -159,7 +166,7 @@ class SearchWindow(QWidget):
         """)
         self.search_input.textChanged.connect(self.on_text_changed)
         search_layout.addWidget(self.search_input)
-        
+
         self.mode_btn = QPushButton("Semantic")
         self.mode_btn.setCursor(Qt.PointingHandCursor)
         self.mode_btn.setStyleSheet("""
@@ -177,9 +184,9 @@ class SearchWindow(QWidget):
         """)
         self.mode_btn.clicked.connect(self.toggle_search_mode)
         search_layout.addWidget(self.mode_btn)
-        
+
         container_layout.addLayout(search_layout)
-        
+
         # Scroll area for results
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -208,44 +215,44 @@ class SearchWindow(QWidget):
         self.scroll_area.setWidget(self.results_list)
         self.scroll_area.hide()
         container_layout.addWidget(self.scroll_area)
-        
+
         # Status and Skipped
         status_layout = QHBoxLayout()
-        
+
         self.status_label = QLabel()
         self.status_label.setStyleSheet("color: rgba(255, 255, 255, 0.5); font-size: 11px;")
         self.status_label.setWordWrap(True)
         self.status_label.hide()
-        
+
         self.skipped_label = QLabel()
         self.skipped_label.setStyleSheet("color: rgba(239, 68, 68, 0.7); font-size: 11px;")
         self.skipped_label.hide()
-        
+
         status_layout.addWidget(self.status_label)
         status_layout.addStretch()
         status_layout.addWidget(self.skipped_label)
-        
+
         container_layout.addLayout(status_layout)
-        
+
         main_layout.addWidget(self.container)
-        
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        
+
         painter.fillRect(self.rect(), Qt.transparent)
-        
+
         rect = self.rect().adjusted(15, 15, -15, -15)
-        
+
         bg_color = QColor(20, 20, 30, 235)
         painter.setBrush(QBrush(bg_color))
-        
+
         pen = QPen(QColor(255, 255, 255, 20))
         pen.setWidth(1)
         painter.setPen(pen)
-        
+
         painter.drawRoundedRect(rect, 16, 16)
-        
+
     def toggle_search_mode(self):
         if self.search_mode == "semantic":
             self.search_mode = "keyword"
@@ -281,7 +288,7 @@ class SearchWindow(QWidget):
             """)
         self._trigger_search()
         self.search_input.setFocus()
-        
+
     def toggle(self):
         if self.isVisible():
             self.hide()
@@ -292,14 +299,14 @@ class SearchWindow(QWidget):
             self.status_label.hide()
             self.skipped_label.hide()
             self.setFixedSize(700, 80 + 30) # extra space for margins
-            
+
             screen = QApplication.primaryScreen().geometry()
             self.move((screen.width() - self.width()) // 2, (screen.height() - self.height()) // 2 - 200)
-            
+
             self.show()
             self.activateWindow()
             self.search_input.setFocus()
-            
+
     def on_text_changed(self, text: str):
         if not text.strip():
             self.search_timer.stop()
@@ -312,7 +319,7 @@ class SearchWindow(QWidget):
             self.setFixedSize(700, 80 + 30)
         else:
             self.search_timer.start()
-            
+
     def _trigger_search(self):
         query = self.search_input.text().strip()
 
@@ -327,14 +334,14 @@ class SearchWindow(QWidget):
 
         if query:
             self.search_requested.emit(query, self.search_mode)
-            
+
     def on_search_results(self, results: list[SearchResult]):
         query = self.search_input.text().strip()
         self.results_list.set_results(results, query)
-        
+
         # Reset status label styling in case of previous errors
         self.status_label.setStyleSheet("color: rgba(255, 255, 255, 0.5); font-size: 11px;")
-        
+
         if results:
             self.scroll_area.show()
             self.status_label.setText(f"{len(results)} results found")
@@ -352,11 +359,11 @@ class SearchWindow(QWidget):
         self.scroll_area.hide()
         self.skipped_label.hide()
         self.results_list.set_results([], "")
-        
+
         self.status_label.setText(f"⚠️ {message}")
         self.status_label.setStyleSheet("color: rgba(239, 68, 68, 0.9); font-size: 12px; font-weight: bold;")
         self.status_label.show()
-        
+
         # Adjust size to fit multiline error text
         self.setFixedSize(700, 130 + 30)
 
@@ -372,7 +379,7 @@ class SearchWindow(QWidget):
         if os.path.exists(file_path):
             os.startfile(file_path)
             self.hide()
-            
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.hide()
@@ -388,12 +395,12 @@ class SearchWindow(QWidget):
             self.ensure_selected_visible()
         else:
             super().keyPressEvent(event)
-            
+
     def ensure_selected_visible(self):
         if self.results_list.selected_index >= 0 and self.results_list.items:
             item = self.results_list.items[self.results_list.selected_index]
             self.scroll_area.ensureWidgetVisible(item, 0, 0)
-            
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.drag_pos = event.globalPosition().toPoint()
@@ -418,8 +425,9 @@ class SearchWindow(QWidget):
 
 
 def launch_search_window(config: HaydarConfig):
-    from haydar.logging_setup import setup_logging
     import logging
+
+    from haydar.logging_setup import setup_logging
 
     # Windowed GUI has no console; persist logs to file only.
     setup_logging(console=False)

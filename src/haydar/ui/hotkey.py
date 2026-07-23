@@ -1,6 +1,6 @@
 import logging
 import threading
-from typing import Callable
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ class HotkeyListener:
     def start(self):
         try:
             from pynput.keyboard import GlobalHotKeys
-            
+
             def _run():
                 self._listener = GlobalHotKeys({self.hotkey: self.callback})
                 with self._listener:

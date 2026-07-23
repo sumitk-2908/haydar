@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +32,13 @@ CURRENT_SCHEMA_VERSION = 1
 def _default_folders() -> list[str]:
     """Return the user's common document folders that exist.
 
-    Defaults to Documents, Desktop, and Downloads. Falls back to the current
-    working directory if none of those exist.
+    Defaults to Documents, Desktop, and Downloads. Returns an empty list if none
+    of those exist -- callers (``haydar init``) then prompt for folders rather
+    than silently indexing an arbitrary directory (e.g. an EXE's launch cwd).
     """
     home = Path.home()
     candidates = [home / "Documents", home / "Desktop", home / "Downloads"]
-    existing = [str(p) for p in candidates if p.is_dir()]
-    if existing:
-        return existing
-    return [str(Path.cwd())]
+    return [str(p) for p in candidates if p.is_dir()]
 
 
 # ── File type size limits (bytes) ──────────────────────────────────────────────
@@ -171,7 +168,7 @@ class HaydarConfig:
 
     # Initialized flag
     initialized: bool = False
-    
+
     # DB Schema Version
     schema_version: int = CURRENT_SCHEMA_VERSION
 
@@ -221,12 +218,11 @@ def get_size_category(extension: str) -> str:
 def is_excluded(path: Path, excluded_patterns: list[str]) -> bool:
     """Check if a path should be excluded from indexing."""
     parts = path.parts
-    
+
     # Check root-anchored exclusions (parts[1] is the folder immediately inside the drive root)
-    if len(parts) > 1:
-        if parts[1].lower() in ROOT_ANCHORED_EXCLUSIONS:
-            return True
-            
+    if len(parts) > 1 and parts[1].lower() in ROOT_ANCHORED_EXCLUSIONS:
+        return True
+
     # Check name-based exclusions
     for pattern in excluded_patterns:
         for part in parts:
@@ -251,8 +247,8 @@ def get_rg_path() -> Path:
     where `haydar init` fetches it for pip installs), then (3) the local dev
     path next to this file. Raises HaydarConfigError if not found.
     """
-    import sys
     import platform
+    import sys
 
     executable_name = "rg.exe" if platform.system().lower() == "windows" else "rg"
 

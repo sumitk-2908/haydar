@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Fast, local semantic file search for Windows. Find files by what they contain, not what they're named."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Haydar Team" },
 ]
@@ -20,7 +20,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -49,6 +48,8 @@ ocr = [
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
 ]
 
 [project.scripts]
@@ -76,3 +77,9 @@ packages = ["src/haydar"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.mypy]
+ignore_missing_imports = true
+check_untyped_defs = false
+disable_error_code = ["attr-defined", "arg-type", "var-annotated", "dict-item", "misc", "union-attr", "assignment"]
+

@@ -1,16 +1,13 @@
-import json
 from pathlib import Path
 
-import pytest
-
 from haydar.config import (
+    CURRENT_SCHEMA_VERSION,
     HaydarConfig,
+    get_rg_path,
     get_size_category,
     is_excluded,
-    get_rg_path,
-    HaydarConfigError,
-    CURRENT_SCHEMA_VERSION,
 )
+
 
 def test_config_defaults(tmp_path):
     config = HaydarConfig()
@@ -41,6 +38,7 @@ def test_is_excluded_root_anchored():
 def test_get_rg_path_finds_user_binary(tmp_haydar, monkeypatch):
     """get_rg_path returns a binary placed in the user bin dir."""
     import platform
+
     import haydar.config as config
 
     bin_dir = tmp_haydar / "bin"

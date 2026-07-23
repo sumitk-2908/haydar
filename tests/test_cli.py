@@ -1,4 +1,5 @@
 from typer.testing import CliRunner
+
 from haydar.cli import app
 
 runner = CliRunner()
