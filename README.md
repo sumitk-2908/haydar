@@ -2,6 +2,10 @@
 
 **Fast, local semantic file search for Windows.**
 
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 Find any file by *what it contains*, not what it's named. Powered by AI embeddings, entirely on-device — no cloud, no API costs.
 
 ---
@@ -18,37 +22,54 @@ Find any file by *what it contains*, not what it's named. Powered by AI embeddin
 
 ## Quick Start
 
-```bash
-pip install haydar
-haydar init
-haydar search "quarterly budget report"
+Download the standalone EXE from the [latest release](https://github.com/haydar-search/haydar/releases), verify it (see below), then:
+
+```powershell
+haydar-cli.exe init
+haydar-cli.exe search "quarterly budget report"
 ```
 
 ## Installation
 
 ### Requirements
 
-- Python 3.10+
+- Python 3.11+ (only needed for a source/dev install)
 - Windows 10/11
 
-### Install from PyPI
-
-```bash
-pip install haydar
-```
-
-### Standalone Windows EXE
+### Standalone Windows EXE (recommended)
 
 Prebuilt executables are attached to each [GitHub Release](https://github.com/haydar-search/haydar/releases):
 
 - `haydar.exe` — the floating search UI (no console window).
 - `haydar-cli.exe` — the full command-line interface.
 
-Verify the download against its `.sha256` file, then run `haydar-cli.exe init` once to set up your index.
+Each EXE ships with a matching `.sha256` file. Verify the download before running it:
+
+```powershell
+# Compare the printed hash to the contents of the .sha256 file
+(Get-FileHash haydar-cli.exe -Algorithm SHA256).Hash.ToLower() -eq
+    (Get-Content haydar-cli.exe.sha256).Split(' ')[0].ToLower()
+```
+
+`True` means the download is intact. A ready-to-run copy of this check is in
+[`verify.ps1`](./verify.ps1), and [`install.ps1`](./install.ps1) will download,
+verify, install to `%LOCALAPPDATA%\Haydar\`, and add it to your PATH.
+
+Then run `haydar-cli.exe init` once to set up your index.
 
 > **Note:** The EXEs are not code-signed yet, so Windows SmartScreen may show a
 > "Windows protected your PC" warning on first launch. Click **More info →
 > Run anyway**. Verifying the SHA-256 checksum confirms the download is intact.
+
+### Install from source
+
+```powershell
+git clone https://github.com/haydar-search/haydar.git
+cd haydar
+pip install -e .[dev,ocr]
+python scripts/pull-rg.py   # fetch + verify ripgrep
+haydar init
+```
 
 ### Optional: Image OCR Support
 
@@ -146,7 +167,7 @@ Config is stored at `~/.haydar/config.json`. You can edit it directly or use `ha
 
 | Component | Technology |
 |-----------|-----------|
-| Language | Python 3.10+ |
+| Language | Python 3.11+ |
 | Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) |
 | Vector DB | ChromaDB (fully local) |
 | Text extraction | pypdf, python-docx, chardet |
@@ -156,6 +177,23 @@ Config is stored at `~/.haydar/config.json`. You can edit it directly or use `ha
 | Desktop UI | PySide6 |
 | Global hotkey | pynput |
 | CLI | Typer + Rich |
+
+## Development
+
+```powershell
+pip install -e .[dev,ocr]        # dev install
+python scripts/pull-rg.py        # fetch + verify ripgrep
+
+ruff check src/ tests/           # lint
+mypy src/haydar                  # type-check
+pytest tests/ -q --cov=haydar --cov-report=term-missing   # tests + coverage
+```
+
+**Architecture rule (enforced):** UI modules under `src/haydar/ui/` may import
+only from `src/haydar/search/` or `src/haydar/config.py` — never from
+`indexer/` internals. This keeps the backend replaceable without touching the
+UI. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full contributor guide and
+[SECURITY.md](./SECURITY.md) for the security model and reporting.
 
 ## License
 

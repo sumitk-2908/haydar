@@ -6,14 +6,19 @@ Monitors configured directories and updates the index on file changes.
 from __future__ import annotations
 
 import logging
-import time
+import os
 import threading
+import time
 from pathlib import Path
+from typing import Any
 
-from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileCreatedEvent, FileModifiedEvent, FileDeletedEvent, FileMovedEvent
+from watchdog.events import (
+    FileSystemEvent,
+    FileSystemEventHandler,
+)
 from watchdog.observers import Observer
 
-from haydar.config import HaydarConfig, ALL_INDEXABLE_EXTENSIONS, is_excluded
+from haydar.config import ALL_INDEXABLE_EXTENSIONS, HaydarConfig, is_excluded
 from haydar.indexer.engine import IndexingEngine
 
 logger = logging.getLogger(__name__)
@@ -35,25 +40,23 @@ class _DebouncedHandler(FileSystemEventHandler):
         """Check if file should be indexed based on extension and exclusion rules."""
         if filepath.suffix.lower() not in ALL_INDEXABLE_EXTENSIONS:
             return False
-        if is_excluded(filepath, self.config.excluded_patterns):
-            return False
-        return True
+        return not is_excluded(filepath, self.config.excluded_patterns)
 
     def _debounce(self, path_str: str) -> bool:
         """Return True if the event should be processed (not debounced)."""
         current_time = time.time()
         last_time = self.last_events.get(path_str, 0.0)
-        
+
         if current_time - last_time < self.debounce_seconds:
             return False
-            
+
         self.last_events[path_str] = current_time
         return True
 
     def _index_with_retry(self, filepath: Path) -> None:
         """Attempt to index a file, with retries for locks (common on Windows)."""
         retries = [0.1, 0.5, 1.0]
-        
+
         for attempt, delay in enumerate(retries, start=1):
             try:
                 success = self.engine.index_file(filepath)
@@ -74,43 +77,43 @@ class _DebouncedHandler(FileSystemEventHandler):
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-            
-        path = Path(event.src_path)
+
+        path = Path(os.fsdecode(event.src_path))
         path_str = str(path)
-        
+
         if self._should_process(path) and self._debounce(path_str):
             self._async_index(path)
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-            
-        path = Path(event.src_path)
+
+        path = Path(os.fsdecode(event.src_path))
         path_str = str(path)
-        
+
         if self._should_process(path) and self._debounce(path_str):
             self._async_index(path)
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-            
-        path = Path(event.src_path)
+
+        path = Path(os.fsdecode(event.src_path))
         self.engine.remove_file(path)
         logger.info(f"Removed: {path.name}")
 
     def on_moved(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-            
-        src_path = Path(event.src_path)
-        dest_path = Path(event.dest_path)
-        
+
+        src_path = Path(os.fsdecode(event.src_path))
+        dest_path = Path(os.fsdecode(getattr(event, 'dest_path', '')))
+
         self.engine.remove_file(src_path)
-        
+
         if self._should_process(dest_path):
             self._async_index(dest_path)
-            
+
         logger.info(f"Moved: {src_path.name} -> {dest_path.name}")
 
 
@@ -120,7 +123,7 @@ class FileWatcher:
     def __init__(self, config: HaydarConfig):
         self.config = config
         self.engine = IndexingEngine(config)
-        self._observer = None
+        self._observer: Any = None
 
     def start(self, blocking: bool = True) -> None:
         """Start the file watcher."""
@@ -178,9 +181,9 @@ def install_autostart() -> None:
     """Create a .bat file in the Windows Startup folder to run the watcher on login."""
     startup_dir = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
     startup_dir.mkdir(parents=True, exist_ok=True)
-    
+
     bat_path = startup_dir / "haydar_watcher.bat"
-    
+
     import sys
     if getattr(sys, "frozen", False):
         exe_path = Path(sys.executable)
@@ -191,8 +194,8 @@ def install_autostart() -> None:
             command = f'"{exe_path}" watch'
     else:
         command = "pythonw -m haydar watch"
-        
+
     content = f"@echo off\n{command}\n"
     bat_path.write_text(content, encoding="utf-8")
-    
+
     logger.info(f"Autostart script installed successfully at: {bat_path}")

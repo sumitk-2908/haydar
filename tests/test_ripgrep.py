@@ -3,11 +3,11 @@ import hashlib
 import pytest
 
 from haydar.ripgrep import (
-    verify_checksum,
-    get_release_asset,
-    ensure_ripgrep,
-    RipgrepError,
     CHECKSUMS,
+    RipgrepError,
+    ensure_ripgrep,
+    get_release_asset,
+    verify_checksum,
 )
 
 

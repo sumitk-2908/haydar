@@ -1,0 +1,6 @@
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501", "B008", "B904"]
+
+[lint.per-file-ignores]
+"tests/*" = ["S101"]

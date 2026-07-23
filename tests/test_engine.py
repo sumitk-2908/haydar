@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from haydar.indexer.engine import IndexingEngine
 
@@ -42,43 +41,46 @@ def test_compute_hash_changes_with_content(tmp_path):
 
 def test_engine_lazy_store_initialization(tmp_path):
     from unittest.mock import patch
+
     from haydar.config import HaydarConfig
-    
+
     config = HaydarConfig()
     config.folders = [str(tmp_path)]
-    
+
     with patch("haydar.indexer.engine.VectorStore") as mock_store:
         engine = IndexingEngine(config, allow_download=False)
         # VectorStore should not be instantiated yet
         mock_store.assert_not_called()
-        
+
         # Accessing .store should instantiate it exactly once
         store1 = engine.store
         mock_store.assert_called_once_with(config, allow_download=False)
-        
+
         # Accessing it again should return the same cached object
         store2 = engine.store
         assert store1 is store2
         assert mock_store.call_count == 1
-        
+
         engine.close()
 
 
 def test_engine_missing_model_deferred_error(tmp_path):
     from unittest.mock import patch
+
     import pytest
+
     from haydar.config import HaydarConfig
     from haydar.search.store import VectorStoreError
-    
+
     config = HaydarConfig()
     config.folders = [str(tmp_path)]
-    
+
     with patch("haydar.indexer.engine.VectorStore", side_effect=VectorStoreError("Missing model")):
         # Should not raise during init
         engine = IndexingEngine(config, allow_download=False)
-        
+
         # Should raise on first access
         with pytest.raises(VectorStoreError, match="Missing model"):
             _ = engine.store
-            
+
         engine.close()

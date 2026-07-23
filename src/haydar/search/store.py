@@ -4,12 +4,12 @@ ChromaDB vector store wrapper for Haydar.
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from contextlib import suppress
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-from haydar.config import HaydarConfig, DB_DIR, MODELS_DIR
+from haydar.config import DB_DIR, MODELS_DIR, HaydarConfig
 
 
 class VectorStoreError(Exception):
@@ -23,7 +23,9 @@ class VectorStoreError(Exception):
 
 
 class VectorStore:
-    def __init__(self, config: HaydarConfig, allow_download: bool = False):
+    def __init__(
+        self, config: HaydarConfig, allow_download: bool = True
+    ) -> None:
         self.config = config
 
         # Ensure sentence-transformers caches models in our directory. Done here
@@ -31,12 +33,11 @@ class VectorStore:
         os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(MODELS_DIR)
 
         # Check for model existence if download not allowed
-        if not allow_download:
-            if not list(MODELS_DIR.glob("models--*")):
-                raise VectorStoreError(
-                    f"Model not found at {MODELS_DIR}.",
-                    hint="Run `haydar init` to download it.",
-                )
+        if not allow_download and not list(MODELS_DIR.glob("models--*")):
+            raise VectorStoreError(
+                f"Model not found at {MODELS_DIR}.",
+                hint="Run `haydar init` to download it.",
+            )
 
         try:
             self.client = chromadb.PersistentClient(path=str(DB_DIR))
@@ -97,7 +98,7 @@ class VectorStore:
         """Delete all chunks belonging to a list of file paths."""
         if not filepaths:
             return
-            
+
         # ChromaDB 'in' operator has limits, but we can do it via get+delete
         # To handle potentially large lists, we fetch and delete in batches of 100
         batch_size = 100
@@ -128,7 +129,7 @@ class VectorStore:
             include=["documents", "metadatas", "distances"]
         )
         return self._format_query_results(results)
-        
+
     def _format_query_results(self, results: dict) -> list[dict]:
         """Format ChromaDB query results into a list of dicts."""
         formatted_results = []
@@ -147,19 +148,19 @@ class VectorStore:
                 "metadata": metadatas[i] if metadatas and i < len(metadatas) else None,
                 "distance": distances[i] if distances and i < len(distances) else None
             })
-        
+
         return formatted_results
 
     def get_stats(self) -> dict:
         """Return stats: files_indexed, chunks_stored, db_size_bytes."""
         chunks_stored = self.collection.count()
-        
+
         all_metadatas = self.collection.get(include=["metadatas"])["metadatas"]
         if all_metadatas:
             files_indexed = len(set(m.get("file_path") for m in all_metadatas if m and "file_path" in m))
         else:
             files_indexed = 0
-            
+
         db_size_bytes = 0
         if DB_DIR.exists():
             for root, _, files in os.walk(str(DB_DIR)):
@@ -167,7 +168,7 @@ class VectorStore:
                     file_path = os.path.join(root, file)
                     if not os.path.islink(file_path):
                         db_size_bytes += os.path.getsize(file_path)
-                        
+
         return {
             "files_indexed": files_indexed,
             "chunks_stored": chunks_stored,
@@ -176,11 +177,9 @@ class VectorStore:
 
     def clear(self) -> None:
         """Delete the entire collection and recreate it."""
-        try:
+        with suppress(ValueError):
             self.client.delete_collection("haydar_files")
-        except ValueError:
-            pass
-        
+
         self.collection = self.client.get_or_create_collection(
             name="haydar_files",
             embedding_function=self.embedding_function,
@@ -193,7 +192,7 @@ class VectorStore:
         metadatas = results.get("metadatas", [])
         if not metadatas:
             return set()
-            
+
         return {m.get("file_path") for m in metadatas if m and "file_path" in m}
 
     def get_file_hash(self, filepath: str) -> str | None:
