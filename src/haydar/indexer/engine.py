@@ -32,8 +32,15 @@ class ExtractionResult:
 class IndexingEngine:
     def __init__(self, config: HaydarConfig, allow_download: bool = False):
         self.config = config
-        self.store = VectorStore(config, allow_download=allow_download)
+        self._allow_download = allow_download
+        self._store = None
         self.cache = FileCache()
+
+    @property
+    def store(self) -> VectorStore:
+        if self._store is None:
+            self._store = VectorStore(self.config, allow_download=self._allow_download)
+        return self._store
 
     @contextmanager
     def _acquire_index_lock(self, *, blocking: bool):
