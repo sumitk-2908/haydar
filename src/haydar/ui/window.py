@@ -433,10 +433,9 @@ class SearchWindow(QWidget):
             extra_height += 40
         if not self.status_label.isHidden():
             one_line_height = self.status_label.fontMetrics().lineSpacing()
-            # The error state reserves two lines (message plus canonical log
-            # path); other states reserve one. Each state's additional baseline
-            # height is also available before wrapped content grows the window.
-            baseline_lines = 2 if base_height == self.BASE_ERROR_HEIGHT else 1
+            # The error baseline reserves room for the message, log path, and
+            # one platform-dependent wrap line. Longer text may still expand it.
+            baseline_lines = 3 if base_height == self.BASE_ERROR_HEIGHT else 1
             status_height_budget = baseline_lines * one_line_height + max(
                 0, base_height - self.BASE_EMPTY_HEIGHT
             )
