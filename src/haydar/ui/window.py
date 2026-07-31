@@ -1,10 +1,12 @@
+import logging
 import os
 import signal
 import sys
 import threading
+import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -18,11 +20,55 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import haydar
 from haydar.config import HaydarConfig
 from haydar.search.hybrid import HybridSearch, SearchResult
 from haydar.ui.hotkey import HotkeyListener
 from haydar.ui.results import ResultsList
+from haydar.ui.theme import ThemeColors
+from haydar.updater import get_latest_version, get_release_url, is_newer
 
+
+def _configure_qt_dpi_policy() -> None:
+    """Configure Qt 6 fractional scaling before QApplication construction."""
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+
+class UpdateCheckWorker(QObject):
+    update_available = Signal(str)   # emits latest version string
+    checked = Signal(float)
+    finished = Signal()
+
+    def __init__(self, config: HaydarConfig):
+        super().__init__()
+        self.config = config
+
+    def check(self):
+        try:
+            if self.config.update_check_interval_hours == 0:
+                return
+            if not getattr(sys, "frozen", False):
+                return
+            now = time.time()
+            if now < self.config.update_check_snoozed_until:
+                return
+            elapsed = now - self.config.last_update_check
+            if 0 <= elapsed < self.config.update_check_interval_hours * 3600:
+                return
+            latest = get_latest_version()
+            if latest is None:
+                return
+            if is_newer(latest, haydar.__version__):
+                self.update_available.emit(latest)
+            # Persist on the GUI thread so a background write cannot race with
+            # settings changes or overwrite newer in-memory configuration.
+            self.checked.emit(time.time())
+        except Exception:
+            logging.getLogger(__name__).exception("Background update check failed")
+        finally:
+            self.finished.emit()
 
 class SearchWorker(QObject):
     finished = Signal(list)
@@ -48,13 +94,13 @@ class SearchWorker(QObject):
                 logging.getLogger(__name__).warning(f"Error killing ripgrep: {e}")
             self.rg_process = None
 
-    def do_search(self, query: str, mode: str):
+    def do_search(self, query: str, mode: str, limit: int):
         self.cancel_event.clear()
         if not query.strip():
             self.finished.emit([])
             return
         try:
-            for results in self.search_engine.search_stream(query, mode=mode, cancel_event=self.cancel_event, worker=self):
+            for results in self.search_engine.search_stream(query, limit=limit, mode=mode, cancel_event=self.cancel_event, worker=self):
                 if self.cancel_event.is_set():
                     break
                 self.finished.emit(results)
@@ -68,18 +114,44 @@ class SearchWorker(QObject):
                 self.finished.emit([])
 
 class SearchWindow(QWidget):
-    search_requested = Signal(str, str)
+    """Floating search window using Qt logical pixels for all geometry.
+
+    Qt widget coordinates are device-independent (logical) pixels.  Native
+    Win32 DPI awareness is configured separately at process startup; widget
+    dimensions must not be multiplied by ``devicePixelRatio()``.
+    """
+
+    BASE_WIDTH = 700
+    MIN_WIDTH = 320
+    BASE_EMPTY_HEIGHT = 110
+    BASE_RESULTS_HEIGHT = 530
+    BASE_ERROR_HEIGHT = 160
+    SCREEN_MARGIN = 16
+    VERTICAL_OFFSET = 200
+
+    search_requested = Signal(str, str, int)
     toggle_requested = Signal()
 
     def __init__(self, config: HaydarConfig):
         super().__init__()
         self.config = config
         self.toggle_requested.connect(self.toggle)
+        self._always_on_top = config.always_on_top
+        self._hotkey_listener = None
+        self._settings_window = None
+        self._whatsnew_banner: QWidget | None = None
 
         # Setup UI properties
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        flags = Qt.FramelessWindowHint | Qt.Tool
+        if self._always_on_top:
+            flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setWindowTitle("Haydar — File Search")
+        self.setWindowOpacity(self.config.window_opacity / 100.0)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setFixedSize(700, 80)
+        # A temporary fixed construction size is deliberately avoided. The
+        # layout establishes the initial size after all controls are present.
+        self.resize(self.BASE_WIDTH, self.BASE_EMPTY_HEIGHT)
 
         # Search engine & threading
         self.search_mode = "semantic"  # default mode
@@ -109,14 +181,34 @@ class SearchWindow(QWidget):
 
         self.setup_ui()
 
+        self._update_thread: QThread | None = None
+        self._update_worker: UpdateCheckWorker | None = None
+        self._start_update_check()
+
         # Debounce timer
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(300)
+        self.search_timer.setInterval(int(self.config.watcher_debounce_seconds * 1000) if hasattr(self, 'config') else 300)
         self.search_timer.timeout.connect(self._trigger_search)
 
         # Drag state
         self.drag_pos = None
+
+        from haydar import __version__
+
+        if self.config.last_seen_version == "":
+            # First install — record silently, no banner. A persistence failure
+            # must not prevent the application from starting.
+            self.config.last_seen_version = __version__
+            try:
+                self.config.save()
+            except OSError:
+                self.config.last_seen_version = ""
+                logging.getLogger(__name__).exception(
+                    "Could not persist the first-launch version"
+                )
+        elif self.config.last_seen_version != __version__:
+            self._show_whatsnew_banner(__version__)
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -142,13 +234,45 @@ class SearchWindow(QWidget):
         container_layout.setContentsMargins(16, 16, 16, 16)
         container_layout.setSpacing(12)
 
-        # Search Input & Toggle
+        # Update Banner
+        self._update_banner = QWidget()
+        self._update_banner.setStyleSheet("border: 1px solid rgba(245, 158, 11, 0.5); border-radius: 6px; padding: 4px 8px;")
+        banner_layout = QHBoxLayout(self._update_banner)
+        banner_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._update_label = QLabel()
+        self._update_label.setTextFormat(Qt.PlainText)
+        self._update_label.setWordWrap(True)
+        self._update_label.setStyleSheet(f"border: none; color: {ThemeColors.TEXT_PRIMARY};")
+        self._update_label.setAccessibleName("Update available status")
+
+        self._download_btn = QPushButton("Download")
+        self._download_btn.setStyleSheet(f"border: 1px solid rgba(245, 158, 11, 0.5); border-radius: 4px; padding: 2px 8px; background: transparent; color: {ThemeColors.TEXT_PRIMARY};")
+        self._download_btn.setAccessibleName("Download update")
+        self._download_btn.setAccessibleDescription("Download the latest release from GitHub")
+
+        self._dismiss_btn = QPushButton("×")
+        self._dismiss_btn.setStyleSheet(f"border: none; font-weight: bold; font-size: 16px; padding: 0 4px; color: {ThemeColors.TEXT_INFO_ALPHA}; background: transparent;")
+        self._dismiss_btn.setAccessibleName("Dismiss update")
+        self._dismiss_btn.setAccessibleDescription("Hide this update notification")
+
+        banner_layout.addWidget(self._update_label)
+        banner_layout.addStretch()
+        banner_layout.addWidget(self._download_btn)
+        banner_layout.addWidget(self._dismiss_btn)
+        self._update_banner.hide()
+        container_layout.addWidget(self._update_banner)
+
+        # Search input, mode, and settings are layout-owned so system font and
+        # style changes cannot cause the settings control to overlap content.
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
         search_layout.setSpacing(10)
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 Search your files...")
+        self.search_input.setAccessibleName("Search query")
+        self.search_input.setAccessibleDescription("Enter text to search files")
         self.search_input.setStyleSheet("""
             QLineEdit {
                 background-color: rgba(255, 255, 255, 0.06);
@@ -169,26 +293,50 @@ class SearchWindow(QWidget):
 
         self.mode_btn = QPushButton("Semantic")
         self.mode_btn.setCursor(Qt.PointingHandCursor)
-        self.mode_btn.setStyleSheet("""
-            QPushButton {
+        self.mode_btn.setAccessibleName("Search mode")
+        self.mode_btn.setAccessibleDescription("Current mode is Semantic. Press to toggle.")
+        self.mode_btn.setStyleSheet(f"""
+            QPushButton {{
                 background-color: rgba(147, 51, 234, 0.2);
                 border: 1px solid rgba(147, 51, 234, 0.5);
                 border-radius: 12px;
-                color: #d8b4fe;
+                color: {ThemeColors.MODE_SEMANTIC};
                 font-weight: bold;
                 padding: 10px 15px;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: rgba(147, 51, 234, 0.3);
-            }
+            }}
         """)
         self.mode_btn.clicked.connect(self.toggle_search_mode)
         search_layout.addWidget(self.mode_btn)
+
+        self.settings_btn = QPushButton("⚙")
+        self.settings_btn.setMinimumSize(24, 24)
+        self.settings_btn.setMaximumSize(32, 32)
+        self.settings_btn.setToolTip("Open Haydar settings (Ctrl+,)")
+        self.settings_btn.setAccessibleName("Settings")
+        self.settings_btn.setAccessibleDescription("Open Haydar configuration window")
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                border: 1px solid transparent;
+                background: transparent;
+                font-size: 14px;
+            }
+            QPushButton:hover, QPushButton:focus {
+                color: #d8b4fe;
+                border-color: #00d4ff;
+            }
+        """)
+        self.settings_btn.clicked.connect(self._show_settings)
+        search_layout.addWidget(self.settings_btn)
 
         container_layout.addLayout(search_layout)
 
         # Scroll area for results
         self.scroll_area = QScrollArea()
+        self.scroll_area.setAccessibleName("Search results area")
+        self.scroll_area.setAccessibleDescription("Scrollable area containing matching files")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("""
             QScrollArea {
@@ -220,12 +368,16 @@ class SearchWindow(QWidget):
         status_layout = QHBoxLayout()
 
         self.status_label = QLabel()
-        self.status_label.setStyleSheet("color: rgba(255, 255, 255, 0.5); font-size: 11px;")
+        self.status_label.setTextFormat(Qt.PlainText)
+        self.status_label.setStyleSheet(f"color: {ThemeColors.TEXT_INFO_ALPHA}; font-size: 11px;")
         self.status_label.setWordWrap(True)
+        self.status_label.setAccessibleName("Search status")
         self.status_label.hide()
 
         self.skipped_label = QLabel()
-        self.skipped_label.setStyleSheet("color: rgba(239, 68, 68, 0.7); font-size: 11px;")
+        self.skipped_label.setTextFormat(Qt.PlainText)
+        self.skipped_label.setStyleSheet(f"color: {ThemeColors.TEXT_ERROR_ALPHA}; font-size: 11px;")
+        self.skipped_label.setAccessibleName("Skipped files warning")
         self.skipped_label.hide()
 
         status_layout.addWidget(self.status_label)
@@ -235,6 +387,114 @@ class SearchWindow(QWidget):
         container_layout.addLayout(status_layout)
 
         main_layout.addWidget(self.container)
+
+        QWidget.setTabOrder(self.search_input, self.mode_btn)
+        QWidget.setTabOrder(self.mode_btn, self._download_btn)
+        QWidget.setTabOrder(self._download_btn, self._dismiss_btn)
+        QWidget.setTabOrder(self._dismiss_btn, self.settings_btn)
+
+    def _target_screen(self):
+        """Return the screen relevant to this invocation, never an unrelated primary."""
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen is None and self.windowHandle() is not None:
+            screen = self.windowHandle().screen()
+        return screen or QApplication.primaryScreen()
+
+    def _logical_width(self, screen=None) -> int:
+        """Return design width clamped to the target work area in logical pixels."""
+        screen = screen or self._target_screen()
+        if screen is None:
+            return self.BASE_WIDTH
+        available_width = max(1, screen.availableGeometry().width() - 2 * self.SCREEN_MARGIN)
+        return min(self.BASE_WIDTH, available_width)
+
+    def _set_logical_size(self, width: int, height: int, screen=None) -> None:
+        """Fit logical dimensions to the target screen without DPR multiplication."""
+        logical_width = max(1, int(width))
+        logical_height = max(1, int(height))
+        screen = screen or self._target_screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            logical_width = min(logical_width, max(1, available.width()))
+            logical_height = min(logical_height, max(1, available.height()))
+        self.setFixedSize(logical_width, logical_height)
+
+    def _set_content_height(self, base_height: int, screen=None) -> None:
+        """Size the active state while allowing wrapped dynamic text to expand."""
+        self._current_base_height = base_height
+        self.layout().activate()
+        extra_height = 0
+        # isVisible() is false while the top-level window is hidden, even when a
+        # child is intended to appear at the next show. isHidden() tracks the
+        # child's explicit state and therefore also works during construction.
+        if not self._update_banner.isHidden():
+            extra_height += self._update_banner.sizeHint().height() + 12
+        if self._whatsnew_banner is not None and not self._whatsnew_banner.isHidden():
+            extra_height += 40
+        if not self.status_label.isHidden():
+            one_line_height = self.status_label.fontMetrics().lineSpacing()
+            # The error state reserves two lines (message plus canonical log
+            # path); other states reserve one. Each state's additional baseline
+            # height is also available before wrapped content grows the window.
+            baseline_lines = 2 if base_height == self.BASE_ERROR_HEIGHT else 1
+            status_height_budget = baseline_lines * one_line_height + max(
+                0, base_height - self.BASE_EMPTY_HEIGHT
+            )
+            extra_height += max(
+                0, self.status_label.sizeHint().height() - status_height_budget
+            )
+        self._set_logical_size(
+            self._logical_width(screen), base_height + extra_height, screen
+        )
+
+    def _start_update_check(self) -> None:
+        """Start the one-shot update worker behind a patchable lifecycle boundary."""
+        thread = QThread(self)
+        worker = UpdateCheckWorker(self.config)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.check)
+        worker.update_available.connect(self.on_update_available)
+        worker.checked.connect(self._record_update_check)
+        worker.finished.connect(thread.quit)
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    def _record_update_check(self, checked_at: float) -> None:
+        self.config.last_update_check = checked_at
+        try:
+            self.config.save()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not persist the update-check timestamp"
+            )
+
+
+    def on_update_available(self, version: str) -> None:
+        self._available_version = version
+        self._update_label.setText(f"Haydar {version} is available.")
+        self._update_label.setAccessibleDescription(f"Version {version} is available for download")
+
+        if not getattr(self, "_update_actions_connected", False):
+            self._download_btn.clicked.connect(self._download_update)
+            self._dismiss_btn.clicked.connect(self._dismiss_update)
+            self._update_actions_connected = True
+
+        self._current_base_height = getattr(self, "_current_base_height", self.BASE_EMPTY_HEIGHT)
+        self._update_banner.show()
+        self._set_content_height(self._current_base_height)
+
+    def _download_update(self) -> None:
+        try:
+            os.startfile(get_release_url(self._available_version))
+        except OSError:
+            logging.getLogger(__name__).exception("Could not open release page")
+
+    def _dismiss_update(self) -> None:
+        self._update_banner.hide()
+        self.config.update_check_snoozed_until = time.time() + 7 * 86400
+        self.config.save()
+        self._set_content_height(self._current_base_height)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -257,34 +517,38 @@ class SearchWindow(QWidget):
         if self.search_mode == "semantic":
             self.search_mode = "keyword"
             self.mode_btn.setText("Keyword")
-            self.mode_btn.setStyleSheet("""
-                QPushButton {
+            self.mode_btn.setAccessibleName("Search mode: Keyword")
+            self.mode_btn.setAccessibleDescription("Current mode is Keyword. Press to toggle.")
+            self.mode_btn.setStyleSheet(f"""
+                QPushButton {{
                     background-color: rgba(16, 185, 129, 0.2);
                     border: 1px solid rgba(16, 185, 129, 0.5);
                     border-radius: 12px;
-                    color: #6ee7b7;
+                    color: {ThemeColors.MODE_KEYWORD};
                     font-weight: bold;
                     padding: 10px 15px;
-                }
-                QPushButton:hover {
+                }}
+                QPushButton:hover {{
                     background-color: rgba(16, 185, 129, 0.3);
-                }
+                }}
             """)
         else:
             self.search_mode = "semantic"
             self.mode_btn.setText("Semantic")
-            self.mode_btn.setStyleSheet("""
-                QPushButton {
+            self.mode_btn.setAccessibleName("Search mode: Semantic")
+            self.mode_btn.setAccessibleDescription("Current mode is Semantic. Press to toggle.")
+            self.mode_btn.setStyleSheet(f"""
+                QPushButton {{
                     background-color: rgba(147, 51, 234, 0.2);
                     border: 1px solid rgba(147, 51, 234, 0.5);
                     border-radius: 12px;
-                    color: #d8b4fe;
+                    color: {ThemeColors.MODE_SEMANTIC};
                     font-weight: bold;
                     padding: 10px 15px;
-                }
-                QPushButton:hover {
+                }}
+                QPushButton:hover {{
                     background-color: rgba(147, 51, 234, 0.3);
-                }
+                }}
             """)
         self._trigger_search()
         self.search_input.setFocus()
@@ -298,10 +562,22 @@ class SearchWindow(QWidget):
             self.scroll_area.hide()
             self.status_label.hide()
             self.skipped_label.hide()
-            self.setFixedSize(700, 80 + 30) # extra space for margins
+            screen = self._target_screen()
+            self._set_content_height(self.BASE_EMPTY_HEIGHT, screen)
 
-            screen = QApplication.primaryScreen().geometry()
-            self.move((screen.width() - self.width()) // 2, (screen.height() - self.height()) // 2 - 200)
+            if screen is not None:
+                available = screen.availableGeometry()
+                # Sizing happens against this same work area, so the full window
+                # is reachable even on portrait/tiny or heterogeneous monitors.
+                fitted_x = available.left() + (available.width() - self.width()) // 2
+                fitted_y = available.top() + (available.height() - self.height()) // 2
+                max_x = available.right() - self.width() + 1
+                max_y = available.bottom() - self.height() + 1
+                x = min(max(fitted_x, available.left()), max_x)
+                y = min(max(fitted_y, available.top()), max_y)
+                # Apply the preferred upward offset only within safe bounds.
+                y = max(available.top(), y - self.VERTICAL_OFFSET)
+                self.move(x, y)
 
             self.show()
             self.activateWindow()
@@ -316,7 +592,7 @@ class SearchWindow(QWidget):
             self.scroll_area.hide()
             self.status_label.hide()
             self.skipped_label.hide()
-            self.setFixedSize(700, 80 + 30)
+            self._set_content_height(self.BASE_EMPTY_HEIGHT)
         else:
             self.search_timer.start()
 
@@ -333,43 +609,50 @@ class SearchWindow(QWidget):
         self.search_worker.cancel()
 
         if query:
-            self.search_requested.emit(query, self.search_mode)
+            self.search_requested.emit(query, self.search_mode, self.config.results_limit)
 
     def on_search_results(self, results: list[SearchResult]):
         query = self.search_input.text().strip()
         self.results_list.set_results(results, query)
 
         # Reset status label styling in case of previous errors
-        self.status_label.setStyleSheet("color: rgba(255, 255, 255, 0.5); font-size: 11px;")
+        self.status_label.setStyleSheet(f"color: {ThemeColors.TEXT_INFO_ALPHA}; font-size: 11px;")
 
         if results:
             self.scroll_area.show()
             self.status_label.setText(f"{len(results)} results found")
+            self.status_label.setAccessibleDescription(f"{len(results)} results found")
             self.status_label.show()
-            self.setFixedSize(700, 500 + 30)
+            self._set_content_height(self.BASE_RESULTS_HEIGHT)
         else:
             self.scroll_area.hide()
-            # Only set "No results" if it's not currently displaying an error
-            if "⚠️" not in self.status_label.text():
-                self.status_label.setText("No results found")
-                self.status_label.show()
-            self.setFixedSize(700, 110 + 30)
+            # A successful empty search replaces any previous error state.
+            self.status_label.setText("No results found")
+            self.status_label.setAccessibleDescription("No results found")
+            self.status_label.show()
+            self._set_content_height(self.BASE_EMPTY_HEIGHT)
 
     def on_search_error(self, message: str):
-        self.scroll_area.hide()
-        self.skipped_label.hide()
-        self.results_list.set_results([], "")
+        """Handle errors from the search worker."""
+        from haydar.config import get_log_path
 
-        self.status_label.setText(f"⚠️ {message}")
-        self.status_label.setStyleSheet("color: rgba(239, 68, 68, 0.9); font-size: 12px; font-weight: bold;")
+        log_msg = f"Full log: {get_log_path()}"
+        if log_msg not in message:
+            message = f"{message}\n{log_msg}"
+
+        self.status_label.setText(f"Error: {message}")
+        self.status_label.setAccessibleDescription("Error: " + message)
+        self.status_label.setStyleSheet(f"color: {ThemeColors.TEXT_ERROR_ALPHA}; font-size: 12px; font-weight: bold;")
         self.status_label.show()
 
         # Adjust size to fit multiline error text
-        self.setFixedSize(700, 130 + 30)
+        self._set_content_height(self.BASE_ERROR_HEIGHT)
 
     def on_skipped_files(self, skipped: list[str]):
         if skipped:
-            self.skipped_label.setText(f"{len(skipped)} files skipped (e.g. permission denied)")
+            msg = f"{len(skipped)} files skipped (e.g. permission denied)"
+            self.skipped_label.setText(msg)
+            self.skipped_label.setAccessibleDescription(msg)
             self.skipped_label.show()
             self.skipped_label.setToolTip("\n".join(skipped[:10]) + ("\n..." if len(skipped) > 10 else ""))
         else:
@@ -381,12 +664,18 @@ class SearchWindow(QWidget):
             self.hide()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key_Comma and event.modifiers() == Qt.ControlModifier:
+            self._show_settings()
+        elif event.key() == Qt.Key_Escape:
             self.hide()
-        elif event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
-            result = self.results_list.get_selected_result()
-            if result:
-                self.open_file(result.file_path)
+        elif event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter or event.key() == Qt.Key_Space:
+            focus_widget = QApplication.focusWidget()
+            if isinstance(focus_widget, QPushButton) or self.search_input.hasFocus():
+                super().keyPressEvent(event)
+            else:
+                result = self.results_list.get_selected_result()
+                if result:
+                    self.open_file(result.file_path)
         elif event.key() == Qt.Key_Down or (event.key() == Qt.Key_N and event.modifiers() == Qt.ControlModifier):
             self.results_list.select_next()
             self.ensure_selected_visible()
@@ -418,10 +707,148 @@ class SearchWindow(QWidget):
         event.accept()
 
     def closeEvent(self, event):
+        if self._update_thread is not None:
+            self._update_thread.quit()
+            self._update_thread.wait()
+            if self._update_worker is not None:
+                self._update_worker.deleteLater()
+            self._update_thread.deleteLater()
+            self._update_worker = None
+            self._update_thread = None
         if self.search_thread is not None:
             self.search_thread.quit()
             self.search_thread.wait()
+            self.search_worker.deleteLater()
+            self.search_thread.deleteLater()
+            self.search_worker = None
+            self.search_thread = None
+        if self._hotkey_listener is not None:
+            self._hotkey_listener.stop()
         super().closeEvent(event)
+
+    def set_settings_window(self, window):
+        self._settings_window = window
+
+    def _show_settings(self):
+        if self._settings_window:
+            self._settings_window.show_settings()
+
+    def on_config_changed(self, config: HaydarConfig) -> None:
+        self.config = config
+        self._restart_hotkey(config.hotkey)
+        self.setWindowOpacity(config.window_opacity / 100.0)
+        self.search_timer.setInterval(int(config.watcher_debounce_seconds * 1000))
+        if config.always_on_top != self._always_on_top:
+            # Reapplying window flags requires hide() and show(), causing a one-frame flicker.
+            self.hide()
+            flags = self.windowFlags()
+            if config.always_on_top:
+                flags |= Qt.WindowStaysOnTopHint
+            else:
+                flags &= ~Qt.WindowStaysOnTopHint
+            self.setWindowFlags(flags)
+            self.show()
+            self._always_on_top = config.always_on_top
+
+    def _restart_hotkey(self, hotkey: str) -> None:
+        if self._hotkey_listener is not None:
+            self._hotkey_listener.stop()
+        self._hotkey_listener = HotkeyListener(hotkey, self.toggle_requested.emit)
+        self._hotkey_listener.start()
+
+    def _show_whatsnew_banner(self, version: str) -> None:
+        self._whatsnew_banner = QWidget()
+        self._whatsnew_banner.setObjectName("whatsNewBanner")
+        self._whatsnew_banner.setStyleSheet(
+            "border: 1px solid rgba(99,102,241,0.5); "
+            "border-radius: 6px; padding: 4px 8px;"
+        )
+        layout = QHBoxLayout(self._whatsnew_banner)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._whatsnew_label = QLabel(f"Updated to Haydar {version}!")
+        self._whatsnew_label.setTextFormat(Qt.PlainText)
+        self._whatsnew_label.setStyleSheet("border: none;")
+        self._whatsnew_label.setAccessibleName("Haydar update status")
+        self._whatsnew_label.setAccessibleDescription(
+            f"Haydar was updated to version {version}"
+        )
+
+        self._see_whatsnew_btn = QPushButton("See what's new")
+        self._see_whatsnew_btn.setObjectName("seeWhatsNewButton")
+        self._see_whatsnew_btn.setAccessibleName("See what's new")
+        self._see_whatsnew_btn.setAccessibleDescription(
+            "Open settings to view changes in this Haydar version"
+        )
+        self._see_whatsnew_btn.setStyleSheet(
+            "border: 1px solid rgba(99,102,241,0.5); border-radius: 4px; "
+            "padding: 2px 8px; background: transparent;"
+        )
+        self._see_whatsnew_btn.clicked.connect(self._open_whats_new)
+
+        self._dismiss_whatsnew_btn = QPushButton("×")
+        self._dismiss_whatsnew_btn.setObjectName("dismissWhatsNewButton")
+        self._dismiss_whatsnew_btn.setAccessibleName("Dismiss what's new")
+        self._dismiss_whatsnew_btn.setAccessibleDescription(
+            "Hide this version notification"
+        )
+        self._dismiss_whatsnew_btn.setStyleSheet(
+            "border: none; font-weight: bold; font-size: 16px; "
+            "padding: 0 4px; background: transparent;"
+        )
+        self._dismiss_whatsnew_btn.clicked.connect(self._dismiss_whats_new)
+
+        layout.addWidget(self._whatsnew_label)
+        layout.addStretch()
+        layout.addWidget(self._see_whatsnew_btn)
+        layout.addWidget(self._dismiss_whatsnew_btn)
+        self.container.layout().insertWidget(1, self._whatsnew_banner)
+        self._set_content_height(
+            getattr(self, "_current_base_height", self.BASE_EMPTY_HEIGHT)
+        )
+
+    def _open_whats_new(self) -> None:
+        if self._settings_window is None:
+            logging.getLogger(__name__).warning(
+                "Cannot open What's New because settings is unavailable"
+            )
+            return
+        try:
+            self._settings_window.show_whats_new()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not open the What's New settings tab"
+            )
+            return
+        if self._mark_seen():
+            self._hide_whats_new_banner()
+
+    def _dismiss_whats_new(self) -> None:
+        if self._mark_seen():
+            self._hide_whats_new_banner()
+
+    def _hide_whats_new_banner(self) -> None:
+        if self._whatsnew_banner is None:
+            return
+        self._whatsnew_banner.hide()
+        self._set_content_height(
+            getattr(self, "_current_base_height", self.BASE_EMPTY_HEIGHT)
+        )
+
+    def _mark_seen(self) -> bool:
+        from haydar import __version__
+
+        previous_version = self.config.last_seen_version
+        self.config.last_seen_version = __version__
+        try:
+            self.config.save()
+        except OSError:
+            self.config.last_seen_version = previous_version
+            logging.getLogger(__name__).exception(
+                "Could not persist the acknowledged version"
+            )
+            return False
+        return True
 
 
 def launch_search_window(config: HaydarConfig):
@@ -434,6 +861,8 @@ def launch_search_window(config: HaydarConfig):
     logger = logging.getLogger(__name__)
 
     try:
+        # Qt 6 already uses logical pixels; never multiply widget geometry by DPR.
+        _configure_qt_dpi_policy()
         app = QApplication(sys.argv)
 
         font = QFont("Inter", 10)
@@ -441,8 +870,12 @@ def launch_search_window(config: HaydarConfig):
 
         window = SearchWindow(config)
 
-        hotkey_listener = HotkeyListener(config.hotkey, window.toggle_requested.emit)
-        hotkey_listener.start()
+        from haydar.ui.settings import SettingsWindow
+        settings_window = SettingsWindow(config)
+        settings_window.config_changed.connect(window.on_config_changed)
+        window.set_settings_window(settings_window)
+
+        window._restart_hotkey(config.hotkey)
 
         got_sigint = False
         def sigint_handler(signum, frame):
@@ -461,7 +894,8 @@ def launch_search_window(config: HaydarConfig):
         try:
             app.exec()
         finally:
-            hotkey_listener.stop()
+            if window._hotkey_listener:
+                window._hotkey_listener.stop()
 
         if got_sigint:
             raise KeyboardInterrupt()

@@ -278,6 +278,7 @@ class IndexingEngine:
                             batch_documents.append(chunk_info["text"])
                             batch_metadatas.append({
                                 "file_path": filepath_str,
+                                "filepath": filepath_str,
                                 "file_type": Path(filepath_str).suffix.lower(),
                                 "chunk_index": i,
                                 "start_char": chunk_info["start_char"],

@@ -12,10 +12,40 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 from haydar.config import DB_DIR, MODELS_DIR, HaydarConfig
 
 
+def _model_cache_name(model_name: str) -> str:
+    """Return Hugging Face's cache directory name for a configured model."""
+    normalized = model_name.strip().replace("\\", "/").strip("/")
+    if "/" not in normalized:
+        normalized = f"sentence-transformers/{normalized}"
+    return "models--" + normalized.replace("/", "--")
+
+
+def _classify_storage_error(exc: Exception, operation: str) -> tuple[str, str]:
+    """Map storage failures to bounded, safe user messages and remedies."""
+    detail = str(exc).lower()
+    if isinstance(exc, PermissionError) or "permission" in detail or "access is denied" in detail:
+        return (
+            f"The vector database at {DB_DIR} cannot be accessed.",
+            "Check folder permissions and close other Haydar processes, then try again.",
+        )
+    if "lock" in detail or "in use" in detail or "busy" in detail:
+        return (
+            f"The vector database at {DB_DIR} is currently in use.",
+            "Close other Haydar processes and try again.",
+        )
+    if "corrupt" in detail or "malformed" in detail or "not a database" in detail:
+        return (
+            f"The vector database at {DB_DIR} is corrupt.",
+            "Run `haydar-cli.exe reindex` to recreate the database; your files are unaffected.",
+        )
+    return (
+        f"The vector database {operation} failed.",
+        "Check available disk space and the full log, then try again.",
+    )
+
+
 class VectorStoreError(Exception):
-    """Raised when the vector store cannot be initialized (missing model,
-    corrupt database, etc.). Callers are expected to catch this and surface a
-    friendly message rather than letting the process die."""
+    """A bounded user-facing vector-store failure with an actionable hint."""
 
     def __init__(self, message: str, hint: str | None = None):
         super().__init__(message)
@@ -32,21 +62,23 @@ class VectorStore:
         # (not at import time) so importing this module has no global side effects.
         os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(MODELS_DIR)
 
-        # Check for model existence if download not allowed
-        if not allow_download and not list(MODELS_DIR.glob("models--*")):
+        # A cache for some unrelated model is insufficient. Require this exact
+        # configured model and at least one snapshot payload.
+        expected_model = MODELS_DIR / _model_cache_name(config.embedding_model)
+        model_complete = expected_model.is_dir() and any(
+            path.is_file() for path in expected_model.glob("snapshots/**/*")
+        )
+        if not allow_download and not model_complete:
             raise VectorStoreError(
-                f"Model not found at {MODELS_DIR}.",
-                hint="Run `haydar init` to download it.",
+                f"The embedding model '{config.embedding_model}' was not found locally.",
+                hint="Run `haydar-cli.exe init` to download the configured model.",
             )
 
         try:
             self.client = chromadb.PersistentClient(path=str(DB_DIR))
         except Exception as exc:
-            # Catch ChromaDB corruption errors (e.g. sqlite3.DatabaseError)
-            raise VectorStoreError(
-                f"Database corruption detected in {DB_DIR}: {exc}",
-                hint="Please run `haydar reindex` to recreate your database.",
-            ) from exc
+            message, hint = _classify_storage_error(exc, "could not be opened")
+            raise VectorStoreError(message, hint=hint) from exc
 
         try:
             self.embedding_function = SentenceTransformerEmbeddingFunction(
@@ -56,10 +88,10 @@ class VectorStore:
             hint = (
                 "Please check your internet connection and try again."
                 if allow_download
-                else "Run `haydar init` to download the embedding model."
+                else "Run `haydar-cli.exe init` to download the embedding model."
             )
             raise VectorStoreError(
-                f"Failed to load embedding model '{config.embedding_model}': {exc}",
+                f"The embedding model '{config.embedding_model}' could not be loaded.",
                 hint=hint,
             ) from exc
 
@@ -70,10 +102,8 @@ class VectorStore:
                 metadata={"hnsw:space": "cosine"}
             )
         except Exception as exc:
-            raise VectorStoreError(
-                f"Failed to initialize collection: {exc}",
-                hint="Please run `haydar reindex` to recreate your database.",
-            ) from exc
+            message, hint = _classify_storage_error(exc, "collection initialization")
+            raise VectorStoreError(message, hint=hint) from exc
 
     def add_documents(self, ids: list[str], documents: list[str], metadatas: list[dict]) -> None:
         """Add documents to the collection."""
@@ -193,7 +223,7 @@ class VectorStore:
         if not metadatas:
             return set()
 
-        return {m.get("file_path") for m in metadatas if m and "file_path" in m}
+        return {str(m["file_path"]) for m in metadatas if m and "file_path" in m}
 
     def get_file_hash(self, filepath: str) -> str | None:
         """Get stored hash for a file path."""

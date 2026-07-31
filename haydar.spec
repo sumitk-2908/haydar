@@ -13,7 +13,7 @@ import os
 from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 # --- Collect data, binaries, and hidden imports for heavy dependencies ---------
-datas = []
+datas = [("CHANGELOG.md", ".")]
 binaries = []
 hiddenimports = [
     "chromadb",
@@ -37,6 +37,8 @@ for pkg in (
     "onnxruntime",
     "huggingface_hub",
     "tqdm",
+    "pytesseract",
+    "PIL",
 ):
     try:
         d, b, h = collect_all(pkg)
@@ -48,7 +50,7 @@ for pkg in (
         pass
 
 # Some packages ship importlib metadata that libraries query at runtime.
-for pkg in ("sentence_transformers", "chromadb", "tqdm"):
+for pkg in ("sentence_transformers", "chromadb", "tqdm", "pytesseract", "Pillow"):
     try:
         datas += copy_metadata(pkg)
     except Exception:

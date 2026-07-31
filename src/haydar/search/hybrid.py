@@ -20,6 +20,51 @@ class SearchResult:
     modified_time: float
 
 
+def _parse_rg_line(line: str) -> "SearchResult | None":
+    """Parse one line of ripgrep --json output.
+
+    Returns a SearchResult if the line is a match event, None otherwise.
+    Never raises — all exceptions are caught and return None.
+    """
+    import json
+    import os
+    try:
+        data = json.loads(line)
+        if data.get("type") != "match":
+            return None
+        match = data.get("data", {})
+        if "path" not in match or "lines" not in match:
+            return None
+
+        file_path = match["path"]["text"]
+        lines = match["lines"]["text"]
+
+        filename = Path(file_path).name
+        folder = str(Path(file_path).parent)
+        file_type = Path(file_path).suffix
+
+        try:
+            mod_time = os.path.getmtime(file_path)
+        except OSError:
+            mod_time = 0.0
+
+        snippet = re.sub(r'\s+', ' ', lines).strip()
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "..."
+
+        return SearchResult(
+            file_path=file_path,
+            filename=filename,
+            folder=folder,
+            file_type=file_type,
+            snippet=snippet,
+            score=1.0,
+            modified_time=mod_time
+        )
+    except Exception:
+        return None
+
+
 class HybridSearch:
     def __init__(self, config: HaydarConfig):
         self.config = config
@@ -57,7 +102,6 @@ class HybridSearch:
             yield from self._stream_ripgrep(query, limit, cancel_event, worker)
 
     def _stream_ripgrep(self, query: str, limit: int, cancel_event, worker):
-        import json
         import os
         import subprocess
         import time
@@ -123,39 +167,9 @@ class HybridSearch:
                 if not line.strip():
                     continue
 
-                try:
-                    data = json.loads(line)
-                    if data.get("type") == "match":
-                        match = data["data"]
-                        file_path = match["path"]["text"]
-                        lines = match["lines"]["text"]
-
-                        filename = Path(file_path).name
-                        folder = str(Path(file_path).parent)
-                        file_type = Path(file_path).suffix
-
-                        try:
-                            mod_time = os.path.getmtime(file_path)
-                        except OSError:
-                            mod_time = 0.0
-
-                        snippet = re.sub(r'\s+', ' ', lines).strip()
-                        if len(snippet) > 200:
-                            snippet = snippet[:200] + "..."
-
-                        # Avoid duplicates
-                        if not any(r.file_path == file_path for r in results):
-                            results.append(SearchResult(
-                                file_path=file_path,
-                                filename=filename,
-                                folder=folder,
-                                file_type=file_type,
-                                snippet=snippet,
-                                score=1.0,
-                                modified_time=mod_time
-                            ))
-                except json.JSONDecodeError:
-                    pass
+                result = _parse_rg_line(line)
+                if result and not any(r.file_path == result.file_path for r in results):
+                    results.append(result)
 
                 now = time.time()
                 if (len(results) % 25 == 0 or (now - last_flush) > 0.150) and results:
@@ -165,6 +179,8 @@ class HybridSearch:
             if results and not (cancel_event and cancel_event.is_set()):
                 yield list(results)[:limit]
 
+            if cancel_event and cancel_event.is_set():
+                process.kill()
             process.wait()
             stderr_thread.join(timeout=1.0)
             if skipped and worker and hasattr(worker, 'skipped_files'):
