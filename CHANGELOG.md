@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-31
+
+### Added
+- Automatic update checks in the CLI and GUI with safe version parsing and direct links to GitHub releases.
+- OCR readiness detection and status reporting for Tesseract, including actionable CLI and Settings guidance.
+- A parsed, packaged changelog with a Settings “What's New” view and post-update notification banner.
+- Expanded accessibility, high-DPI, error handling, scale, updater, OCR, changelog, Settings, and GUI regression coverage.
+- A standalone uninstaller and safer installer handling for existing installations, checksums, and replacement failures.
+- Extraction support and hardening for additional file types, archives, encodings, and malformed inputs.
+
+### Changed
+- Settings and search-window behavior now provide safer persistence, plain-text rendering, responsive sizing, and clearer status feedback.
+- CI and release workflows now validate supported Python versions, OCR packaging, PowerShell scripts, release assets, and checksums.
+- Dependency constraints and package metadata were tightened for reproducible supported builds.
+
+### Fixed
+- OCR detection now distinguishes missing adapters, missing executables, unsupported versions, and probe failures.
+- Changelog discovery and parsing now work in source, wheel, and frozen application layouts.
+- Update checks fail safely on malformed responses and network errors.
+- Search, extraction, configuration, startup, and UI edge cases now degrade without corrupting user state.
+
 ## [0.2.0] - 2026-07-23
 
 ### Added
