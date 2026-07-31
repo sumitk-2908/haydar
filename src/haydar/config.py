@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
@@ -20,6 +24,11 @@ HAYDAR_DIR = Path.home() / ".haydar"
 CONFIG_PATH = HAYDAR_DIR / "config.json"
 DB_DIR = HAYDAR_DIR / "db"
 LOG_DIR = HAYDAR_DIR / "logs"
+
+def get_log_path() -> Path:
+    """Return the path to the main Haydar log file."""
+    return LOG_DIR / "haydar.log"
+
 MODELS_DIR = HAYDAR_DIR / "models"
 CACHE_DIR = HAYDAR_DIR / "cache"
 RIPGREP_DIR = HAYDAR_DIR / "bin"
@@ -166,6 +175,16 @@ class HaydarConfig:
     # Watcher
     watcher_debounce_seconds: float = 0.5
 
+    results_limit: int = 10
+    window_opacity: int = 92        # percent, 50–100
+    always_on_top: bool = True
+    last_update_check: float = 0.0
+    update_check_interval_hours: float = 24.0
+    update_check_snoozed_until: float = 0.0
+
+    # First launch what's new
+    last_seen_version: str = ""
+
     # Initialized flag
     initialized: bool = False
 
@@ -173,12 +192,28 @@ class HaydarConfig:
     schema_version: int = CURRENT_SCHEMA_VERSION
 
     def save(self) -> None:
-        """Persist config to disk."""
-        HAYDAR_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(
-            json.dumps(asdict(self), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        """Persist config atomically, serializing writers within this process."""
+        payload = json.dumps(asdict(self), indent=2, ensure_ascii=False)
+        with _CONFIG_WRITE_LOCK:
+            HAYDAR_DIR.mkdir(parents=True, exist_ok=True)
+            temp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    dir=CONFIG_PATH.parent,
+                    prefix=f".{CONFIG_PATH.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temp_file:
+                    temp_path = Path(temp_file.name)
+                    temp_file.write(payload)
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                os.replace(temp_path, CONFIG_PATH)
+            finally:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
         logger.debug("Config saved to %s", CONFIG_PATH)
 
     @classmethod
@@ -238,7 +273,10 @@ def is_excluded(path: Path, excluded_patterns: list[str]) -> bool:
 
 class HaydarConfigError(Exception):
     """Exception raised for configuration or missing binary errors."""
-    pass
+
+    def __init__(self, message: str, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
 
 def get_rg_path() -> Path:
     """
@@ -269,6 +307,6 @@ def get_rg_path() -> Path:
         return dev_path
 
     raise HaydarConfigError(
-        f"Could not find ripgrep binary '{executable_name}'.\n"
-        "Run 'haydar init' to download it, or execute 'python scripts/pull-rg.py'."
+        f"The ripgrep binary '{executable_name}' could not be found.",
+        hint="Run `haydar-cli.exe init` to download it."
     )

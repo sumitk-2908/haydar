@@ -16,7 +16,7 @@ def tmp_haydar(tmp_path, monkeypatch):
     Returns the root temp path. Patches the copies of the path constants that
     each module captured via ``from haydar.config import ...``.
     """
-    root = tmp_path / ".haydar"
+    root = tmp_path / "haydar-data"
     db = root / "db"
     logs = root / "logs"
     models = root / "models"

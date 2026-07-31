@@ -17,6 +17,7 @@ from haydar.config import (
     IMAGE_EXTENSIONS,
     TEXT_EXTENSIONS,
 )
+from haydar.ocr import TesseractStatus, detect_tesseract
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +66,6 @@ def prune_extraction_cache(max_bytes: int = EXTRACTION_CACHE_MAX_BYTES) -> int:
     except Exception as e:
         logger.warning("Failed to prune extraction cache: %s", e)
         return 0
-
-try:
-    import pytesseract
-    HAS_PYTESSERACT = True
-except ImportError:
-    HAS_PYTESSERACT = False
-
 
 @dataclass
 class ExtractedContent:
@@ -166,21 +160,21 @@ def _extract_text(filepath: Path) -> ExtractedContent | None:
 
 
 def _extract_image(filepath: Path) -> ExtractedContent | None:
-    if not HAS_PYTESSERACT:
-        logger.warning("OCR requires pytesseract and Tesseract OCR engine. Install: pip install haydar[ocr] and download Tesseract from https://github.com/UB-Mannheim/tesseract/wiki")
+    info = detect_tesseract()
+    if info.status is not TesseractStatus.FOUND:
+        logger.warning("Image OCR unavailable: %s", info.status.value)
         return None
 
     try:
-        text = pytesseract.image_to_string(str(filepath), lang='eng')
-        return ExtractedContent(
-            text=text,
-            metadata={}
-        )
+        import pytesseract
+
+        text = pytesseract.image_to_string(str(filepath), lang="eng")
+        return ExtractedContent(text=text, metadata={})
     except pytesseract.TesseractNotFoundError:
-        logger.warning("Tesseract OCR engine is not installed or not in your PATH. Please install Tesseract from https://github.com/UB-Mannheim/tesseract/wiki and restart Haydar.")
+        logger.warning("Tesseract OCR engine became unavailable during image extraction.")
         return None
-    except Exception as e:
-        logger.warning(f"Failed to extract image {filepath}: {e}")
+    except Exception:
+        logger.exception("Failed to extract image %s", filepath)
         return None
 
 

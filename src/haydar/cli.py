@@ -12,11 +12,14 @@ Commands:
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 import typer
 from rich import print as rprint
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -27,7 +30,14 @@ from haydar.config import (
     HaydarConfig,
     _default_folders,
 )
+from haydar.ocr import (
+    TesseractInfo,
+    TesseractStatus,
+    detect_tesseract,
+    get_install_instructions,
+)
 
+logger = logging.getLogger(__name__)
 console = Console()
 
 app = typer.Typer(
@@ -80,7 +90,7 @@ def init(
             if p.is_dir():
                 validated.append(str(p))
             else:
-                rprint(f"[yellow]! Skipping '{f}' -- not a valid directory[/yellow]")
+                _warning(f"Skipping '{f}' because it is not a valid directory.")
         for v in validated:
             if v not in config.folders:
                 config.folders.append(v)
@@ -88,8 +98,7 @@ def init(
         # Default to the user's common document folders
         defaults = _default_folders()
         if not defaults:
-            rprint("[yellow]No default folders found. Please specify with --folders.[/yellow]")
-            raise typer.Exit(1)
+            _fail(Exception("No default folders were found. Specify folders with `--folders`."))
 
         for d in defaults:
             if d not in config.folders:
@@ -97,8 +106,7 @@ def init(
                 config.folders.append(d)
 
     if not config.folders:
-        rprint("[red]x No folders to index. Aborting.[/red]")
-        raise typer.Exit(1)
+        _fail(Exception("No folders are configured for indexing."))
 
     # Save config
     config.initialized = True
@@ -116,6 +124,8 @@ def init(
 
         rprint("[dim]Downloading embedding model (~80 MB); first run only, this may take a minute...[/dim]")
 
+        _print_init_ocr_status(detect_tesseract())
+
         with IndexingEngine(config, allow_download=True) as engine:
             stats = engine.index_all()
 
@@ -125,12 +135,9 @@ def init(
         rprint("[dim]Run [bold]haydar search[/bold] to start searching.[/dim]")
         rprint("[dim]Run [bold]haydar watch[/bold] to start the file watcher.[/dim]")
     except Exception as exc:
-        rprint(f"\n[red]x Indexing failed: {exc}[/red]")
-        hint = getattr(exc, "hint", None)
-        if hint:
-            rprint(f"[dim]{hint}[/dim]")
-        rprint("[dim]Your config has been saved. Run [bold]haydar init[/bold] again to retry.[/dim]")
-        raise typer.Exit(1)
+        if not getattr(exc, "hint", None):
+            exc.hint = "Your configuration was saved. Run `haydar-cli.exe init` again to retry."
+        _fail(exc)
 
 
 # -- haydar search --------------------------------------------------------------
@@ -142,8 +149,8 @@ def search(
         None,
         help="Search query. If omitted, opens the floating search UI.",
     ),
-    limit: int = typer.Option(
-        10,
+    limit: int | None = typer.Option(
+        None,
         "--limit", "-n",
         help="Maximum number of results to display.",
     ),
@@ -157,9 +164,11 @@ def search(
     config = HaydarConfig.load()
     _check_initialized(config)
 
+    if limit is None:
+        limit = config.results_limit
+
     if mode not in ("semantic", "keyword"):
-        rprint(f"[red]x Invalid mode '{mode}'. Use 'semantic' or 'keyword'.[/red]")
-        raise typer.Exit(1)
+        _fail(Exception(f"Search mode '{mode}' is invalid. Use 'semantic' or 'keyword'."))
 
     if query is None:
         # Launch floating UI
@@ -169,9 +178,8 @@ def search(
 
             launch_search_window(config)
         except ImportError as exc:
-            rprint(f"[red]x UI dependencies missing: {exc}[/red]")
-            rprint("[dim]Run [bold]haydar search 'your query'[/bold] for CLI search.[/dim]")
-            raise typer.Exit(1)
+            exc.hint = "Run `haydar-cli.exe search 'your query'` for CLI search."
+            _fail(exc)
     else:
         # CLI search
         try:
@@ -230,8 +238,7 @@ def watch(
             _install()
             rprint("[green]+[/green] Autostart installed. Haydar watcher will run on login.")
         except Exception as exc:
-            rprint(f"[red]x Failed to install autostart: {exc}[/red]")
-            raise typer.Exit(1)
+            _fail(exc)
         return
 
     _banner()
@@ -260,8 +267,7 @@ def watch(
     except KeyboardInterrupt:
         rprint("\n[yellow]Watcher stopped.[/yellow]")
     except Exception as exc:
-        rprint(f"[red]x Watcher failed: {exc}[/red]")
-        raise typer.Exit(1)
+        _fail(exc)
 
 
 # -- haydar status --------------------------------------------------------------
@@ -327,8 +333,7 @@ def show_config(
     if add_folder:
         p = Path(add_folder).resolve()
         if not p.is_dir():
-            rprint(f"[red]x '{add_folder}' is not a valid directory.[/red]")
-            raise typer.Exit(1)
+            _fail(Exception(f"'{add_folder}' is not a valid directory."))
         folder_str = str(p)
         if folder_str not in config.folders:
             config.folders.append(folder_str)
@@ -405,11 +410,77 @@ def reindex() -> None:
         _print_index_stats(stats)
         rprint("\n[green bold]+ Re-index complete![/green bold]")
     except Exception as exc:
-        rprint(f"[red]x Re-indexing failed: {exc}[/red]")
-        hint = getattr(exc, "hint", None)
-        if hint:
-            rprint(f"[dim]{hint}[/dim]")
-        raise typer.Exit(1)
+        _fail(exc)
+
+
+# -- haydar ocr-status ----------------------------------------------------------
+
+
+@app.command("ocr-status")
+def ocr_status() -> None:
+    """Show Tesseract OCR installation status and install instructions."""
+    info = detect_tesseract()
+    if info.detail:
+        logger.warning("OCR readiness check failed: %s", info.detail)
+
+    version = escape(info.version or "unknown")
+    path = escape(info.path or "unknown")
+    if info.status is TesseractStatus.FOUND:
+        rprint(f"[green]Tesseract {version} found at {path}; image OCR enabled.[/green]")
+    elif info.status is TesseractStatus.PYTHON_PACKAGE_MISSING:
+        rprint("[red]Haydar's Python OCR adapter is not installed; image OCR disabled.[/red]")
+        console.print(get_install_instructions(), markup=False)
+    elif info.status is TesseractStatus.NOT_FOUND:
+        rprint("[red]Tesseract executable not found; image OCR disabled.[/red]")
+        console.print(get_install_instructions(), markup=False)
+    elif info.status is TesseractStatus.WRONG_VERSION:
+        rprint(f"[yellow]Tesseract {version} found at {path}, but v4+ is required.[/yellow]")
+        console.print(get_install_instructions(), markup=False)
+    else:
+        rprint(f"[red]Tesseract at {path} could not be verified; image OCR disabled.[/red]")
+        rprint("[dim]Check the Haydar log, then run 'haydar ocr-status' again.[/dim]")
+
+
+# -- haydar update-check --------------------------------------------------------
+
+
+@app.command("update-check")
+def update_check(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Force check even if interval has not elapsed.",
+    ),
+) -> None:
+    """Check for a newer Haydar release on GitHub."""
+    import time
+
+    from haydar.updater import get_latest_version, get_release_url, is_newer
+
+    config = HaydarConfig.load()
+    now = time.time()
+
+    if not force:
+        if now < config.update_check_snoozed_until:
+            rprint("Up to date (update notification dismissed temporarily).")
+            return
+        elapsed = now - config.last_update_check
+        if 0 <= elapsed < config.update_check_interval_hours * 3600:
+            rprint("Up to date (last checked recently).")
+            return
+
+    latest = get_latest_version()
+    if latest is None:
+        _fail(Exception("Could not reach GitHub."))
+
+    if is_newer(latest, __version__):
+        rprint(f"Update available: {latest}")
+        rprint(f"Download: {get_release_url(latest)}")
+    else:
+        rprint(f"Up to date (current: {__version__}).")
+
+    config.last_update_check = time.time()
+    config.save()
 
 
 # -- haydar uninstall -------------------------------------------------------------
@@ -513,8 +584,27 @@ def main(
 
     setup_logging()
 
-
 # -- Helpers --------------------------------------------------------------------
+
+
+def _print_init_ocr_status(info: TesseractInfo) -> None:
+    """Render a concise, markup-safe OCR readiness notice during initialization."""
+    if info.detail:
+        logger.warning("OCR readiness check failed: %s", info.detail)
+
+    version = escape(info.version or "unknown")
+    if info.status is TesseractStatus.FOUND:
+        rprint(f"[green]✓ Tesseract {version} found — image OCR enabled.[/green]")
+    elif info.status is TesseractStatus.PYTHON_PACKAGE_MISSING:
+        rprint("[yellow]Haydar's Python OCR adapter is missing. Image OCR disabled.[/yellow]")
+        rprint("[dim]Install it with: pip install 'haydar[ocr]'[/dim]")
+    elif info.status is TesseractStatus.NOT_FOUND:
+        rprint("[yellow]Tesseract executable not found. Image OCR disabled.[/yellow]")
+        rprint("[dim]Run 'haydar ocr-status' for install instructions.[/dim]")
+    elif info.status is TesseractStatus.WRONG_VERSION:
+        rprint(f"[yellow]⚠ Tesseract {version} found but v4+ required. Image OCR disabled.[/yellow]")
+    else:
+        rprint("[yellow]Tesseract could not be verified. Image OCR disabled; check the Haydar log.[/yellow]")
 
 
 def launch_ui() -> None:
@@ -545,8 +635,10 @@ def _ensure_ripgrep() -> None:
         path = ensure_ripgrep(RIPGREP_DIR)
         rprint(f"[green]>[/green] ripgrep ready at [dim]{path}[/dim]")
     except Exception as exc:
-        rprint(f"[yellow]! Could not fetch ripgrep: {exc}[/yellow]")
-        rprint("[dim]Keyword search will be unavailable. Semantic search still works.[/dim]")
+        _warning(
+            f"Could not fetch ripgrep: {exc}. Keyword search will be unavailable; "
+            "semantic search still works."
+        )
 
 
 def _fail(exc: Exception) -> None:
@@ -555,34 +647,53 @@ def _fail(exc: Exception) -> None:
     Re-raises typer.Exit unchanged so a deliberate clean exit (e.g. exit code 0
     for 'no results') inside a try/except is not turned into a failure.
     """
-    from haydar.search.store import VectorStoreError
+    from haydar.config import get_log_path
 
     if isinstance(exc, typer.Exit):
         raise exc
 
-    rprint(f"[red]x {exc}[/red]")
-    hint = exc.hint if isinstance(exc, VectorStoreError) else getattr(exc, "hint", None)
+    rprint(f"[red]x {escape(str(exc))}[/red]")
+    hint = getattr(exc, "hint", None)
     if hint:
-        rprint(f"[dim]{hint}[/dim]")
+        rprint(f"[dim]{escape(str(hint))}[/dim]")
+
+    log_msg = f"Full log: {get_log_path()}"
+    normalized_path = os.path.normcase(str(get_log_path())).replace("\\", "/")
+    rendered = f"{exc}\n{hint or ''}".replace("\\", "/").lower()
+    if normalized_path.lower() not in rendered:
+        rprint(f"[dim]{escape(log_msg)}[/dim]")
+
     raise typer.Exit(1)
+
+
+def _warning(message: str) -> None:
+    """Render a safe nonfatal warning with the canonical diagnostic path."""
+    from haydar.config import get_log_path
+
+    rprint(f"[yellow]! {escape(message)}[/yellow]")
+    rprint(f"[dim]{escape(f'Full log: {get_log_path()}')}[/dim]")
 
 
 def _check_initialized(config: HaydarConfig) -> None:
     """Abort if Haydar hasn't been initialized, or if DB schema is outdated."""
     if not config.initialized:
-        rprint(
-            "[red]x Haydar is not initialized.[/red]\n"
-            "[dim]Run [bold]haydar init[/bold] first to set up your index.[/dim]"
-        )
-        raise typer.Exit(1)
+        exc = Exception("Haydar is not initialized.")
+        exc.hint = "Run `haydar-cli.exe init` first to set up the index."
+        _fail(exc)
 
     from haydar.config import CURRENT_SCHEMA_VERSION
-    if config.schema_version != CURRENT_SCHEMA_VERSION:
-        rprint(
-            f"[red]x Database schema update required (v{config.schema_version} -> v{CURRENT_SCHEMA_VERSION}).[/red]\n"
-            "[dim]Please run [bold]haydar reindex[/bold] to update your database.[/dim]"
+    if config.schema_version > CURRENT_SCHEMA_VERSION:
+        exc = Exception(
+            f"The index schema v{config.schema_version} is newer than this Haydar version supports."
         )
-        raise typer.Exit(1)
+        exc.hint = "Install the newer Haydar version that created this index; do not reindex with this version."
+        _fail(exc)
+    if config.schema_version < CURRENT_SCHEMA_VERSION:
+        exc = Exception(
+            f"Database schema update required (v{config.schema_version} to v{CURRENT_SCHEMA_VERSION})."
+        )
+        exc.hint = "Run `haydar-cli.exe reindex` to update the database; your files are unaffected."
+        _fail(exc)
 
 
 def _print_index_stats(stats: dict) -> None:

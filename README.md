@@ -52,14 +52,39 @@ Each EXE ships with a matching `.sha256` file. Verify the download before runnin
 ```
 
 `True` means the download is intact. A ready-to-run copy of this check is in
-[`verify.ps1`](./verify.ps1), and [`install.ps1`](./install.ps1) will download,
-verify, install to `%LOCALAPPDATA%\Haydar\`, and add it to your PATH.
+[`verify.ps1`](./verify.ps1), and [`install.ps1`](./install.ps1) will download
+and verify all release assets before replacing an installation, roll back a
+failed commit, install to `%LOCALAPPDATA%\Haydar\`, and add it to your PATH.
+Existing installations require explicit confirmation; use `-Yes` only for
+intentional automation.
 
 Then run `haydar-cli.exe init` once to set up your index.
 
 > **Note:** The EXEs are not code-signed yet, so Windows SmartScreen may show a
 > "Windows protected your PC" warning on first launch. Click **More info →
 > Run anyway**. Verifying the SHA-256 checksum confirms the download is intact.
+
+### Uninstall
+
+To remove Haydar, download [`uninstall.ps1`](https://github.com/haydar-search/haydar/releases/latest/download/uninstall.ps1) from the latest release and run it:
+
+```powershell
+.\uninstall.ps1
+```
+
+By default, this removes the executables, checksum files, autostart script, and
+exact Haydar PATH entries, but preserves indexed data and configuration in
+`~/.haydar/`. The script prompts before changing anything. Noninteractive use
+requires `-Yes`; `-KeepData` explicitly preserves data and takes precedence over
+`-RemoveData`. To completely remove all data, use the `-RemoveData` switch:
+
+```powershell
+.\uninstall.ps1 -RemoveData
+```
+
+If an executable is locked, close Haydar and its watcher, then rerun the script.
+Unrelated files in the installation directory and unrelated or empty PATH
+entries are preserved.
 
 ### Install from source
 

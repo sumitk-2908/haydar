@@ -1,8 +1,16 @@
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtGui import QAccessible, QAccessibleEvent, QCursor
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from haydar.search.hybrid import SearchResult
+from haydar.ui.theme import ThemeColors
 
 
 def _get_file_icon(file_type: str) -> str:
@@ -35,8 +43,9 @@ class ResultItem(QFrame):
     def __init__(self, result: SearchResult, query: str, parent=None):
         super().__init__(parent)
         self.result = result
-        self.setFixedHeight(72)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setFocusPolicy(Qt.ClickFocus)
 
         # Style
         self.setStyleSheet("""
@@ -55,6 +64,12 @@ class ResultItem(QFrame):
         """)
         self.setProperty("selected", False)
 
+        self.setAccessibleName(result.filename)
+        desc_snippet = _prepare_snippet(result.snippet)
+        if len(desc_snippet) > 100:
+            desc_snippet = desc_snippet[:97] + "..."
+        self.setAccessibleDescription(f"{result.folder}\n{desc_snippet}")
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(12)
@@ -62,8 +77,10 @@ class ResultItem(QFrame):
         # Icon
         self.icon_label = QLabel(_get_file_icon(result.file_type))
         self.icon_label.setStyleSheet("font-size: 24px; background: transparent;")
-        self.icon_label.setFixedWidth(32)
+        self.icon_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         self.icon_label.setAlignment(Qt.AlignCenter)
+        self.icon_label.setAccessibleName("")
+        self.icon_label.setAccessibleDescription("")
         layout.addWidget(self.icon_label)
 
         # Center info
@@ -72,11 +89,12 @@ class ResultItem(QFrame):
 
         self.filename_label = QLabel(result.filename)
         self.filename_label.setTextFormat(Qt.PlainText)
-        self.filename_label.setStyleSheet("font-weight: bold; color: white; font-size: 14px; background: transparent;")
+        self.filename_label.setStyleSheet(f"font-weight: bold; color: {ThemeColors.TEXT_PRIMARY}; font-size: 14px; background: transparent;")
 
         self.path_label = QLabel(result.folder)
         self.path_label.setTextFormat(Qt.PlainText)
-        self.path_label.setStyleSheet("color: #aaaaaa; font-size: 11px; background: transparent;")
+        self.path_label.setWordWrap(True)
+        self.path_label.setStyleSheet(f"color: {ThemeColors.TEXT_MUTED}; font-size: 11px; background: transparent;")
 
         snippet = result.snippet
         if len(snippet) > 100:
@@ -84,7 +102,7 @@ class ResultItem(QFrame):
 
         self.snippet_label = QLabel(_prepare_snippet(snippet))
         self.snippet_label.setTextFormat(Qt.PlainText)
-        self.snippet_label.setStyleSheet("color: #cccccc; font-size: 12px; background: transparent;")
+        self.snippet_label.setStyleSheet(f"color: {ThemeColors.TEXT_SECONDARY}; font-size: 12px; background: transparent;")
         self.snippet_label.setWordWrap(True)
 
         info_layout.addWidget(self.filename_label)
@@ -94,7 +112,7 @@ class ResultItem(QFrame):
 
         # Score
         self.score_label = QLabel(f"{int(result.score * 100)}%")
-        self.score_label.setStyleSheet("color: #888888; font-size: 11px; background: transparent;")
+        self.score_label.setStyleSheet(f"color: {ThemeColors.TEXT_SCORE}; font-size: 11px; background: transparent;")
         self.score_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
         layout.addWidget(self.score_label)
 
@@ -107,8 +125,12 @@ class ResultItem(QFrame):
         snippet = result.snippet
         if len(snippet) > 100:
             snippet = snippet[:97] + "..."
-        self.snippet_label.setText(_prepare_snippet(snippet))
+        desc_snippet = _prepare_snippet(snippet)
+        self.snippet_label.setText(desc_snippet)
         self.score_label.setText(f"{int(result.score * 100)}%")
+
+        self.setAccessibleName(result.filename)
+        self.setAccessibleDescription(f"{result.folder}\n{desc_snippet}")
 
     def set_selected(self, selected: bool):
         self.setProperty("selected", selected)
@@ -173,11 +195,16 @@ class ResultsList(QWidget):
         self._set_selected_index((self.selected_index - 1) % len(self.items))
 
     def _set_selected_index(self, index: int):
-        if 0 <= self.selected_index < len(self.items):
-            self.items[self.selected_index].set_selected(False)
+        previous = self.selected_index
+        if 0 <= previous < len(self.items):
+            self.items[previous].set_selected(False)
         self.selected_index = index
         if 0 <= self.selected_index < len(self.items):
-            self.items[self.selected_index].set_selected(True)
+            item = self.items[self.selected_index]
+            item.set_selected(True)
+            if previous != self.selected_index:
+                event = QAccessibleEvent(item, QAccessible.Event.Focus)
+                QAccessible.updateAccessibility(event)
 
     def mouseDoubleClickEvent(self, event):
         child = self.childAt(event.pos())
