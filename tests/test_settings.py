@@ -49,6 +49,18 @@ def test_settings_ocr_detection_is_nonblocking(qtbot, tmp_haydar, monkeypatch):
 
 
 def test_settings_can_close_before_ocr_worker_finishes(qtbot, tmp_haydar, monkeypatch):
+    """Destroying the window mid-detection must still retire its worker.
+
+    This waits on *this* window's job rather than on ``_active_ocr_jobs`` being
+    empty. The registry is class-level, every ``SettingsWindow`` in the suite
+    adds to it, and several tests return before their detection thread retires —
+    so asserting global emptiness waits on unrelated tests' threads and fails
+    whenever CI scheduling leaves one in flight.
+
+    The window is deliberately not registered with ``qtbot``: this test destroys
+    it, and pytest-qt's teardown would call ``close()`` on the freed C++ object,
+    erroring both the teardown and the next test's setup.
+    """
     release = threading.Event()
 
     def slow_detection():
@@ -56,13 +68,15 @@ def test_settings_can_close_before_ocr_worker_finishes(qtbot, tmp_haydar, monkey
         return TesseractInfo(TesseractStatus.FOUND, "5.3.1", "C:/Tesseract/tesseract.exe")
 
     monkeypatch.setattr("haydar.ui.settings.detect_tesseract", slow_detection)
+    before = set(SettingsWindow._active_ocr_jobs)
     w = SettingsWindow(HaydarConfig(folders=[], initialized=True))
-    qtbot.addWidget(w)
+    job = SettingsWindow._active_ocr_jobs - before
+    assert job, "constructing the window must register a detection job"
 
     w.close()
     w.deleteLater()
     release.set()
-    qtbot.waitUntil(lambda: not SettingsWindow._active_ocr_jobs)
+    qtbot.waitUntil(lambda: not (job & SettingsWindow._active_ocr_jobs))
 
 
 @pytest.mark.parametrize(
