@@ -364,14 +364,25 @@ def test_the_uninstall_command_and_script_agree_on_preserving_data():
 
     ``uninstall.ps1`` keeps ``~/.haydar`` unless ``-RemoveData`` is passed, so the
     CLI command must default the same way and offer the same opt-in.
+
+    This reads the command's parameter model rather than its ``--help`` text:
+    Typer renders help through Rich, whose option highlighter splits a flag into
+    separately-styled spans (``--``/``remove``/``-data``) once colour is enabled,
+    so a substring check against the rendered output passes locally on a plain
+    pipe and fails on any runner that looks like a terminal.
     """
-    from typer.testing import CliRunner
+    import typer.main
 
     from haydar.cli import app
 
-    result = CliRunner().invoke(app, ["uninstall", "--help"])
-    assert result.exit_code == 0
-    assert "--remove-data" in result.stdout
+    uninstall_cmd = typer.main.get_command(app).commands["uninstall"]
+    options = {name: param for param in uninstall_cmd.params for name in param.opts}
+
+    assert "--remove-data" in options, "the CLI must offer uninstall.ps1's -RemoveData opt-in"
+    # Opt-in, exactly like the script: absent flag means the profile survives.
+    assert options["--remove-data"].default is False
+    # And it stays discoverable in --help, however Rich decides to style it.
+    assert options["--remove-data"].help
 
 
 def test_uninstall_keeps_the_profile_unless_removal_is_requested(tmp_haydar, monkeypatch):
