@@ -1,5 +1,6 @@
 import logging
 import re
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,6 +84,9 @@ class HybridSearch:
         return self._store
 
     def search_stream(self, query: str, limit: int = 10, mode: str = "semantic", cancel_event=None, worker=None):
+        run_id = secrets.token_hex(4)
+        log_extra = {"run_id": run_id}
+
         if not query or not query.strip():
             yield []
             return
@@ -96,12 +100,15 @@ class HybridSearch:
                     return
                 yield self._merge_and_format([], semantic_results, query, limit)
             except Exception as e:
-                logger.error("Semantic search failed: %s", e)
+                logger.error("Semantic search failed: %s", e, extra=log_extra)
                 yield []
         elif mode == "keyword":
-            yield from self._stream_ripgrep(query, limit, cancel_event, worker)
+            yield from self._stream_ripgrep(query, limit, cancel_event, worker, log_extra)
 
-    def _stream_ripgrep(self, query: str, limit: int, cancel_event, worker):
+    def _stream_ripgrep(self, query: str, limit: int, cancel_event, worker, log_extra=None):
+        if log_extra is None:
+            log_extra = {"run_id": secrets.token_hex(4)}
+
         import os
         import subprocess
         import time
@@ -111,7 +118,7 @@ class HybridSearch:
         try:
             rg_path = get_rg_path()
         except HaydarConfigError as e:
-            logger.error(str(e))
+            logger.error(str(e), extra=log_extra)
             if worker and hasattr(worker, 'error_occurred'):
                 worker.error_occurred.emit(str(e))
             return
@@ -187,7 +194,7 @@ class HybridSearch:
                 worker.skipped_files.emit(skipped)
 
         except Exception as e:
-            logger.error(f"Ripgrep execution failed: {e}")
+            logger.error("Ripgrep execution failed: %s", e, extra=log_extra)
 
     def search(self, query: str, limit: int = 10, mode: str = "semantic") -> list[SearchResult]:
         results = []

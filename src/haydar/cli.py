@@ -1,6 +1,9 @@
 """
 Haydar CLI -- powered by Typer.
 
+An optional expert interface over the same services `haydar.exe` uses. It is not
+required for first run, OCR installation, or recovery.
+
 Commands:
     haydar init        Initialize Haydar, select folders, run first index
     haydar search      Search files (opens UI if no query, CLI if query given)
@@ -8,6 +11,7 @@ Commands:
     haydar status      Show index statistics
     haydar config      Show or edit configuration
     haydar reindex     Force a full re-index of all folders
+    haydar ocr         Install, inspect, and backfill image text recognition
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from rich import print as rprint
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 
 from haydar import __version__
@@ -108,35 +113,74 @@ def init(
     if not config.folders:
         _fail(Exception("No folders are configured for indexing."))
 
-    # Save config
-    config.initialized = True
+    from haydar.lifecycle import IndexLifecycle
+
+    lifecycle = IndexLifecycle(config)
     config.ensure_dirs()
-    config.save()
+    lifecycle.mark_folders_configured(config.folders)
 
     rprint(f"[green]>[/green] Config saved to [dim]{HAYDAR_DIR}[/dim]")
     rprint(f"[green]>[/green] Database at [dim]{DB_DIR}[/dim]\n")
 
-    _ensure_ripgrep()
-
-    rprint("[bold]Starting initial index...[/bold]\n")
+    # Setup provisions search readiness; the crawl is a separate, resumable job.
     try:
-        from haydar.indexer.engine import IndexingEngine
+        from haydar.setup import SetupCoordinator
 
         rprint("[dim]Downloading embedding model (~80 MB); first run only, this may take a minute...[/dim]")
-
         _print_init_ocr_status(detect_tesseract())
 
-        with IndexingEngine(config, allow_download=True) as engine:
-            stats = engine.index_all()
+        with console.status("[cyan]Preparing search...") as status:
+            def report(event) -> None:
+                status.update(f"[cyan]{escape(event.message)}")
 
-        rprint("")
-        _print_index_stats(stats)
-        rprint("\n[green bold]+ Haydar is ready![/green bold]")
-        rprint("[dim]Run [bold]haydar search[/bold] to start searching.[/dim]")
-        rprint("[dim]Run [bold]haydar watch[/bold] to start the file watcher.[/dim]")
+            SetupCoordinator(config).prepare_search(progress_callback=report)
+        rprint("[green]+[/green] Search is ready.\n")
     except Exception as exc:
         if not getattr(exc, "hint", None):
             exc.hint = "Your configuration was saved. Run `haydar-cli.exe init` again to retry."
+        _fail(exc)
+
+    rprint("[bold]Starting initial index...[/bold]\n")
+    try:
+        from haydar.indexer.engine import IndexingEngine, JobControl, JobOutcome
+
+        control = JobControl()
+        with IndexingEngine(config, allow_download=True) as engine, Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("({task.completed}/{task.total})"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Indexing files...", total=None)
+
+            def on_progress(completed: int, total: int) -> None:
+                progress.update(task, completed=completed, total=total or None)
+
+            lifecycle.transition("running")
+            snapshot = engine.run_job(
+                control=control, progress_callback=on_progress
+            )
+
+        if snapshot.outcome is JobOutcome.COMPLETE:
+            lifecycle.transition("complete")
+        elif snapshot.outcome is JobOutcome.FAILED:
+            lifecycle.transition("failed", error=snapshot.error_message)
+        elif snapshot.outcome is JobOutcome.CANCELLED:
+            lifecycle.transition("cancelled")
+
+        rprint("")
+        _print_index_stats(snapshot.to_stats())
+        if snapshot.ocr_deferred:
+            rprint(
+                f"\n[yellow]{snapshot.ocr_deferred} image(s) are waiting for OCR.[/yellow]"
+            )
+            rprint("[dim]Run [bold]haydar-cli.exe ocr install[/bold] to enable image search.[/dim]")
+        rprint("\n[green bold]+ Haydar is ready![/green bold]")
+        rprint("[dim]Launch [bold]haydar.exe[/bold] for the floating search window.[/dim]")
+        rprint("[dim]Run [bold]haydar-cli.exe search 'query'[/bold] to search from here.[/dim]")
+    except Exception as exc:
+        if not getattr(exc, "hint", None):
+            exc.hint = "Search is ready; indexing can be resumed by running this command again."
         _fail(exc)
 
 
@@ -162,13 +206,21 @@ def search(
 ) -> None:
     """Search your files -- by content, semantically."""
     config = HaydarConfig.load()
-    _check_initialized(config)
+    _check_ready(config)
 
     if limit is None:
         limit = config.results_limit
 
     if mode not in ("semantic", "keyword"):
         _fail(Exception(f"Search mode '{mode}' is invalid. Use 'semantic' or 'keyword'."))
+
+    # A partial index is a valid state to search: results improve as the crawl
+    # commits more batches.
+    if config.initial_index_state not in ("complete",):
+        rprint(
+            f"[dim]Note: initial indexing is {config.initial_index_state}; "
+            "results cover indexed files only.[/dim]"
+        )
 
     if query is None:
         # Launch floating UI
@@ -226,10 +278,15 @@ def watch(
         "--install-autostart",
         help="Install Haydar watcher to run automatically on Windows startup.",
     ),
+    wait: bool = typer.Option(
+        False,
+        "--wait",
+        help="Wait for an in-progress initial index to finish instead of exiting.",
+    ),
 ) -> None:
     """Start the background file watcher daemon."""
     config = HaydarConfig.load()
-    _check_initialized(config)
+    _check_ready(config)
 
     if install_autostart:
         try:
@@ -240,6 +297,29 @@ def watch(
         except Exception as exc:
             _fail(exc)
         return
+
+    from haydar.lifecycle import IndexLifecycle
+
+    lifecycle = IndexLifecycle(config)
+    if not lifecycle.is_watcher_eligible:
+        # The gate is never bypassed: starting now would race the initial crawl
+        # for the writer lock.
+        state = config.initial_index_state
+        if not wait:
+            rprint(
+                f"[yellow]The initial index is {state}; the watcher cannot start yet.[/yellow]"
+            )
+            rprint(
+                "[dim]Launch haydar.exe to finish indexing, or re-run with --wait.[/dim]"
+            )
+            raise typer.Exit(1)
+
+        rprint(f"[dim]Initial index is {state}; waiting for it to finish...[/dim]")
+        import time
+
+        while not IndexLifecycle(HaydarConfig.load()).is_watcher_eligible:
+            time.sleep(2.0)
+        config = HaydarConfig.load()
 
     _banner()
     rprint("[bold]Starting file watcher...[/bold]")
@@ -252,18 +332,7 @@ def watch(
     try:
         from haydar.indexer.watcher import FileWatcher
         watcher = FileWatcher(config)
-
-        try:
-            from haydar.ui.window import launch_search_window
-            # Start watcher in background
-            watcher.start(blocking=False)
-            rprint("[dim]Watcher running in background. UI hotkey active.[/dim]")
-            launch_search_window(config)
-        except ImportError:
-            # UI dependencies not installed, run blocking watcher
-            rprint("[dim]UI dependencies not found. Watcher running in blocking mode.[/dim]")
-            watcher.start(blocking=True)
-
+        watcher.start(blocking=True)
     except KeyboardInterrupt:
         rprint("\n[yellow]Watcher stopped.[/yellow]")
     except Exception as exc:
@@ -275,20 +344,61 @@ def watch(
 
 @app.command()
 def status() -> None:
-    """Show index statistics and configuration."""
+    """Show setup readiness, index progress, watcher eligibility, and OCR state."""
     config = HaydarConfig.load()
-    _check_initialized(config)
-
     _banner()
+
+    from haydar.lifecycle import IndexLifecycle
+
+    lifecycle = IndexLifecycle(config)
+
+    rprint("[bold]Readiness:[/bold]")
+    rprint(f"  [dim]Folders configured:[/dim]  {'yes' if config.folders_configured else 'no'}")
+    rprint(f"  [dim]Search ready:[/dim]        {'yes' if config.search_ready else 'no'}")
+    rprint(f"  [dim]Initial index:[/dim]       {config.initial_index_state}")
+    if config.initial_index_error:
+        rprint(f"  [dim]Last error:[/dim]          {escape(config.initial_index_error)}")
+    rprint(
+        f"  [dim]Watcher eligible:[/dim]    "
+        f"{'yes' if lifecycle.is_watcher_eligible else 'no'}"
+    )
+
+    if not config.search_ready:
+        rprint("\n[yellow]Search components are not ready yet.[/yellow]")
+        rprint("[dim]Launch haydar.exe to finish setup.[/dim]")
+        raise typer.Exit(0)
 
     try:
         from haydar.search.store import VectorStore
 
         store = VectorStore(config)
         stats = store.get_stats()
+        rprint("")
         _print_index_stats(stats)
     except Exception as exc:
         _fail(exc)
+
+    try:
+        from haydar.indexer.cache import FileCache
+
+        cache = FileCache()
+        try:
+            dispositions = cache.count_by_disposition()
+        finally:
+            cache.close()
+        deferred = dispositions.get("ocr_deferred", 0)
+        if deferred:
+            rprint(f"\n[yellow]{deferred} image(s) are waiting for OCR.[/yellow]")
+            rprint("[dim]Run `haydar-cli.exe ocr install` to enable image search.[/dim]")
+    except Exception:
+        logger.debug("Could not read cache dispositions", exc_info=True)
+
+    info = detect_tesseract()
+    rprint("\n[bold]OCR:[/bold]")
+    if info.status is TesseractStatus.FOUND:
+        rprint(f"  [green]ready[/green] ({escape(info.version or 'unknown')})")
+    else:
+        rprint(f"  [dim]{escape(info.status.value)}[/dim]")
 
     rprint("\n[bold]Config:[/bold]")
     rprint(f"  [dim]Model:[/dim]     {config.embedding_model}")
@@ -388,29 +498,220 @@ def show_config(
 
 
 @app.command()
-def reindex() -> None:
+def reindex(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
     """Force a full re-index of all configured folders."""
     config = HaydarConfig.load()
-    _check_initialized(config)
+    _check_ready(config)
 
     rprint("[bold]Starting full re-index...[/bold]\n")
     rprint("[yellow]! This will re-process all files. It may take a while.[/yellow]\n")
 
-    confirm = typer.confirm("Continue?", default=True)
-    if not confirm:
+    if not yes and not typer.confirm("Continue?", default=True):
         raise typer.Exit(0)
 
-    try:
-        from haydar.indexer.engine import IndexingEngine
+    from haydar.lifecycle import IndexLifecycle
 
-        with IndexingEngine(config, allow_download=True) as engine:
-            stats = engine.index_all(force=True)
+    lifecycle = IndexLifecycle(config)
+    try:
+        from haydar.indexer.engine import (
+            IndexingEngine,
+            JobControl,
+            JobKind,
+            JobOutcome,
+        )
+
+        with IndexingEngine(config, allow_download=True) as engine, Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("({task.completed}/{task.total})"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Re-indexing...", total=None)
+            snapshot = engine.run_job(
+                kind=JobKind.REBUILD,
+                force=True,
+                control=JobControl(),
+                progress_callback=lambda done, total: progress.update(
+                    task, completed=done, total=total or None
+                ),
+            )
+
+        if snapshot.outcome is JobOutcome.COMPLETE:
+            if lifecycle.state != "running":
+                lifecycle.transition("running")
+            lifecycle.transition("complete")
+        elif snapshot.outcome is JobOutcome.FAILED:
+            _fail(Exception(snapshot.error_message or "Re-index failed."))
 
         rprint("")
-        _print_index_stats(stats)
+        _print_index_stats(snapshot.to_stats())
         rprint("\n[green bold]+ Re-index complete![/green bold]")
     except Exception as exc:
         _fail(exc)
+
+
+# -- haydar ocr -----------------------------------------------------------------
+
+ocr_app = typer.Typer(
+    name="ocr",
+    help="Install, inspect, and backfill image text recognition.",
+    no_args_is_help=True,
+)
+app.add_typer(ocr_app)
+
+
+def _render_ocr_readiness(info: TesseractInfo) -> None:
+    """Print one line describing current OCR readiness."""
+    version = escape(info.version or "unknown")
+    path = escape(info.path or "unknown")
+    if info.status is TesseractStatus.FOUND:
+        rprint(f"[green]Ready:[/green] Tesseract {version} at {path}.")
+    elif info.status is TesseractStatus.PYTHON_PACKAGE_MISSING:
+        rprint("[red]The Python OCR adapter is missing from this build.[/red]")
+        rprint(
+            "  [dim]The engine itself is not the problem — reinstall Haydar to "
+            "restore the bundled adapter.[/dim]"
+        )
+    elif info.status is TesseractStatus.NOT_FOUND:
+        rprint("[yellow]Not installed:[/yellow] no text recognition engine is active.")
+    elif info.status is TesseractStatus.WRONG_VERSION:
+        rprint(f"[yellow]Tesseract {version} at {path} is older than v4.[/yellow]")
+    else:
+        rprint(f"[red]The engine at {path} could not be verified.[/red]")
+
+
+@ocr_app.command("status")
+def ocr_status_command() -> None:
+    """Show text recognition readiness and how many images are waiting."""
+    info = detect_tesseract()
+    if info.detail:
+        logger.warning("OCR readiness check failed: %s", info.detail)
+
+    rprint("[bold]Text recognition:[/bold]")
+    _render_ocr_readiness(info)
+
+    from haydar.ocr import read_active_pointer
+
+    pointer = read_active_pointer()
+    if pointer:
+        rprint(
+            f"  [dim]Private install:[/dim] version {escape(str(pointer.get('version', '?')))}"
+        )
+
+    deferred = _deferred_image_count()
+    if deferred:
+        rprint(f"\n[yellow]{deferred} image(s) are waiting for text recognition.[/yellow]")
+
+    if info.status is TesseractStatus.FOUND:
+        if deferred:
+            rprint("[dim]Run `haydar-cli.exe ocr backfill` to index them now.[/dim]")
+    elif info.status is TesseractStatus.PYTHON_PACKAGE_MISSING:
+        # Distinct from a missing engine, and the one state `ocr install` cannot
+        # resolve: the adapter is checked before the binary is ever looked for,
+        # so installing an engine changes nothing until the build is repaired.
+        pass
+    else:
+        console.print(get_install_instructions(), markup=False)
+
+
+@ocr_app.command("install")
+def ocr_install_command(
+    force: bool = typer.Option(
+        False, "--force", help="Reinstall even when an engine is already active."
+    ),
+    backfill: bool = typer.Option(
+        True,
+        "--backfill/--no-backfill",
+        help="Index images that were waiting for OCR once installation succeeds.",
+    ),
+) -> None:
+    """Download, verify, and privately activate the text recognition engine."""
+    from haydar.ocr import OcrProvisionError, install_ocr
+
+    try:
+        with console.status("[cyan]Setting up text recognition...") as status:
+
+            def report(event) -> None:
+                status.update(f"[cyan]{escape(event.message)}")
+
+            result = install_ocr(progress_callback=report, force=force)
+    except OcrProvisionError as exc:
+        # Already phrased for a person; the error code is the diagnostic detail.
+        logger.warning("OCR provisioning failed (%s)", exc.error_code)
+        _fail(exc)
+    except Exception as exc:
+        _fail(exc)
+
+    if not result.ready:
+        _fail(Exception(result.message or "Text recognition setup did not finish."))
+
+    rprint(f"[green]+[/green] {escape(result.message)}")
+    if result.executable_path:
+        rprint(f"[dim]Engine: {escape(result.executable_path)}[/dim]")
+
+    if backfill:
+        _run_ocr_backfill(result.version_token)
+
+
+@ocr_app.command("backfill")
+def ocr_backfill_command() -> None:
+    """Index images that were deferred or read by an older engine."""
+    info = detect_tesseract()
+    if info.status is not TesseractStatus.FOUND:
+        exc = Exception("Text recognition is not available yet.")
+        exc.hint = "Run `haydar-cli.exe ocr install` first."
+        _fail(exc)
+
+    version_token = f"tesseract-{info.version}" if info.version else "tesseract"
+    _run_ocr_backfill(version_token)
+
+
+def _deferred_image_count() -> int:
+    """How many images are recorded as waiting for OCR."""
+    try:
+        from haydar.indexer.cache import FileCache
+
+        cache = FileCache()
+        try:
+            return cache.count_by_disposition().get("ocr_deferred", 0)
+        finally:
+            cache.close()
+    except Exception:
+        logger.debug("Could not read cache dispositions", exc_info=True)
+        return 0
+
+
+def _run_ocr_backfill(version_token: str) -> None:
+    """Run the image-only backfill over the same coordinator the GUI uses."""
+    config = HaydarConfig.load()
+    _check_ready(config)
+
+    from haydar.indexer.engine import JobOutcome
+    from haydar.indexer.jobs import IndexJobCoordinator
+
+    rprint("\n[bold]Adding image text to search...[/bold]")
+    coordinator = IndexJobCoordinator(config)
+    try:
+        coordinator.start_ocr_backfill(version_token)
+        coordinator.wait_for_terminal()
+    except KeyboardInterrupt:
+        coordinator.cancel()
+        coordinator.wait_for_terminal(timeout=30)
+        rprint("\n[yellow]Backfill cancelled. Indexed images remain searchable.[/yellow]")
+        raise typer.Exit(1) from None
+    except Exception as exc:
+        _fail(exc)
+
+    snapshot = coordinator.snapshot()
+    if snapshot.outcome is JobOutcome.FAILED:
+        _fail(Exception(snapshot.error_message or "The image backfill failed."))
+
+    rprint(
+        f"[green]+[/green] {snapshot.committed_files} image(s) indexed, "
+        f"{snapshot.ocr_deferred} still deferred."
+    )
 
 
 # -- haydar ocr-status ----------------------------------------------------------
@@ -418,7 +719,11 @@ def reindex() -> None:
 
 @app.command("ocr-status")
 def ocr_status() -> None:
-    """Show Tesseract OCR installation status and install instructions."""
+    """Show Tesseract OCR installation status and install instructions.
+
+    Retained as an alias for `haydar-cli.exe ocr status`, which is the form the
+    other commands point at.
+    """
     info = detect_tesseract()
     if info.detail:
         logger.warning("OCR readiness check failed: %s", info.detail)
@@ -438,7 +743,7 @@ def ocr_status() -> None:
         console.print(get_install_instructions(), markup=False)
     else:
         rprint(f"[red]Tesseract at {path} could not be verified; image OCR disabled.[/red]")
-        rprint("[dim]Check the Haydar log, then run 'haydar ocr-status' again.[/dim]")
+        rprint("[dim]Check the Haydar log, then run `haydar-cli.exe ocr status` again.[/dim]")
 
 
 # -- haydar update-check --------------------------------------------------------
@@ -488,10 +793,15 @@ def update_check(
 
 @app.command()
 def uninstall(
+    remove_data: bool = typer.Option(
+        False,
+        "--remove-data",
+        help="Also delete the index and configuration in ~/.haydar (backed up first).",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Print what would be deleted without actually deleting anything.",
+        help="Print what would be removed without removing anything.",
     ),
     yes: bool = typer.Option(
         False,
@@ -499,7 +809,13 @@ def uninstall(
         help="Skip interactive confirmation.",
     )
 ) -> None:
-    """Uninstall Haydar: remove data, config, and autostart script."""
+    """Remove Haydar's autostart entry, and optionally its indexed data.
+
+    Indexed data and configuration in ``~/.haydar`` are **preserved by default**,
+    matching ``uninstall.ps1 -RemoveData``: reinstalling or upgrading must never
+    silently discard a user's index, and the two uninstallers must not disagree
+    about what "uninstall" means. Pass ``--remove-data`` to delete it.
+    """
     import shutil
     import time
 
@@ -509,25 +825,23 @@ def uninstall(
     rprint("[bold]Uninstalling Haydar...[/bold]\n")
 
     if dry_run:
-        rprint("[yellow]DRY RUN - No files will be deleted.[/yellow]")
-        if HAYDAR_DIR.exists():
-            rprint(f"Would backup and delete: [cyan]{HAYDAR_DIR}[/cyan]")
+        rprint("[yellow]DRY RUN - No files will be removed.[/yellow]")
+        if remove_data:
+            state = "" if HAYDAR_DIR.exists() else " (Not found)"
+            rprint(f"Would back up and delete: [cyan]{HAYDAR_DIR}[/cyan]{state}")
         else:
-            rprint(f"Would delete: [cyan]{HAYDAR_DIR}[/cyan] (Not found)")
+            rprint(f"Would keep: [cyan]{HAYDAR_DIR}[/cyan] (use --remove-data to delete)")
 
-        if bat_path.exists():
-            rprint(f"Would delete: [cyan]{bat_path}[/cyan]")
-        else:
-            rprint(f"Would delete: [cyan]{bat_path}[/cyan] (Not found)")
+        state = "" if bat_path.exists() else " (Not found)"
+        rprint(f"Would delete: [cyan]{bat_path}[/cyan]{state}")
         raise typer.Exit(0)
 
-    if not yes:
+    if remove_data and not yes:
         confirm = typer.confirm("This will permanently delete your Haydar index and configuration. A backup will be saved to your Desktop. Continue?", default=False)
         if not confirm:
             raise typer.Exit(0)
 
-    # Backup
-    if HAYDAR_DIR.exists():
+    if remove_data and HAYDAR_DIR.exists():
         timestamp = int(time.time())
         desktop = Path.home() / "Desktop"
         backup_dir = desktop if desktop.exists() else Path.home()
@@ -542,12 +856,13 @@ def uninstall(
             rprint("Aborting uninstall to prevent data loss.")
             raise typer.Exit(1)
 
-        # Delete ~/.haydar
         try:
             shutil.rmtree(HAYDAR_DIR)
             rprint(f"[green]+[/green] Deleted {HAYDAR_DIR}")
         except Exception as e:
             rprint(f"[red]x[/red] Failed to delete {HAYDAR_DIR}: {e}")
+    elif not remove_data:
+        rprint(f"[green]+[/green] Kept your index and settings in {HAYDAR_DIR}")
 
     # Delete autostart
     if bat_path.exists():
@@ -596,13 +911,17 @@ def _print_init_ocr_status(info: TesseractInfo) -> None:
     if info.status is TesseractStatus.FOUND:
         rprint(f"[green]✓ Tesseract {version} found — image OCR enabled.[/green]")
     elif info.status is TesseractStatus.PYTHON_PACKAGE_MISSING:
-        rprint("[yellow]Haydar's Python OCR adapter is missing. Image OCR disabled.[/yellow]")
-        rprint("[dim]Install it with: pip install 'haydar[ocr]'[/dim]")
+        # Never a pip instruction: the adapter ships inside the application, so
+        # its absence is a build problem the user cannot fix with a package
+        # manager.
+        rprint("[yellow]This build's OCR adapter is missing. Image OCR disabled.[/yellow]")
+        rprint("[dim]Reinstall Haydar to restore image text search.[/dim]")
     elif info.status is TesseractStatus.NOT_FOUND:
         rprint("[yellow]Tesseract executable not found. Image OCR disabled.[/yellow]")
-        rprint("[dim]Run 'haydar ocr-status' for install instructions.[/dim]")
+        rprint("[dim]Run `haydar-cli.exe ocr install` to set it up.[/dim]")
     elif info.status is TesseractStatus.WRONG_VERSION:
         rprint(f"[yellow]⚠ Tesseract {version} found but v4+ required. Image OCR disabled.[/yellow]")
+        rprint("[dim]Run `haydar-cli.exe ocr install` to set up a supported engine.[/dim]")
     else:
         rprint("[yellow]Tesseract could not be verified. Image OCR disabled; check the Haydar log.[/yellow]")
 
@@ -674,11 +993,18 @@ def _warning(message: str) -> None:
     rprint(f"[dim]{escape(f'Full log: {get_log_path()}')}[/dim]")
 
 
-def _check_initialized(config: HaydarConfig) -> None:
-    """Abort if Haydar hasn't been initialized, or if DB schema is outdated."""
-    if not config.initialized:
-        exc = Exception("Haydar is not initialized.")
-        exc.hint = "Run `haydar-cli.exe init` first to set up the index."
+def _check_ready(config: HaydarConfig) -> None:
+    """Abort if search prerequisites are unavailable, or the schema is outdated.
+
+    Gating is on ``search_ready``, not on the legacy ``initialized`` flag and not
+    on crawl completion: a partial index is a valid, searchable state.
+    """
+    if not config.search_ready:
+        exc = Exception("Haydar's search components are not ready yet.")
+        exc.hint = (
+            "Launch haydar.exe to finish setup, or run `haydar-cli.exe init` for "
+            "an interactive setup."
+        )
         _fail(exc)
 
     from haydar.config import CURRENT_SCHEMA_VERSION
@@ -694,6 +1020,11 @@ def _check_initialized(config: HaydarConfig) -> None:
         )
         exc.hint = "Run `haydar-cli.exe reindex` to update the database; your files are unaffected."
         _fail(exc)
+
+
+# Retained under its historical name for callers and tests that predate the
+# explicit lifecycle fields.
+_check_initialized = _check_ready
 
 
 def _print_index_stats(stats: dict) -> None:

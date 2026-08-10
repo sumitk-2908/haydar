@@ -1,0 +1,35 @@
+site_name: Haydar
+site_description: Fast, local semantic file search for Windows
+site_url: https://sumitk-2908.github.io/haydar/
+repo_url: https://github.com/sumitk-2908/haydar
+repo_name: sumitk-2908/haydar
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: indigo
+    accent: cyan
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quick Start: quick-start.md
+  - Configuration: configuration.md
+  - Performance: performance.md
+  - Architecture: architecture.md
+  - Changelog: https://github.com/sumitk-2908/haydar/blob/master/CHANGELOG.md
+  - Third-party notices: https://github.com/sumitk-2908/haydar/blob/master/THIRD_PARTY_NOTICES.md
+  - Contributing: https://github.com/sumitk-2908/haydar/blob/master/CONTRIBUTING.md
+  - Security: https://github.com/sumitk-2908/haydar/blob/master/SECURITY.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - tables

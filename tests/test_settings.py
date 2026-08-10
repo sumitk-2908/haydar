@@ -99,7 +99,15 @@ def test_ocr_instruction_dialog_uses_plain_text(qtbot, tmp_haydar, monkeypatch):
     dialog = w.findChild(QMessageBox)
     assert dialog is not None
     assert dialog.textFormat() == pytest.importorskip("PySide6.QtCore").Qt.PlainText
-    assert "haydar[ocr]" in dialog.text()
+    # §19: never sends a normal user to pip, Winget, PATH, or the CLI. The
+    # shipped manifest is unreviewed, so this dialog explains how to install the
+    # engine directly (§19 amended 2026-08-11) rather than offering a one-click
+    # install that would always fail.
+    lowered = dialog.text().lower()
+    assert "tesseract" in lowered
+    assert "never uploaded" in lowered
+    for forbidden in ("pip install", "winget", "path", "haydar-cli"):
+        assert forbidden not in lowered
 
 
 def test_add_folder_updates_pending(qtbot, tmp_haydar, tmp_path, monkeypatch):

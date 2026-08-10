@@ -1,3 +1,4 @@
+import subprocess
 from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import MagicMock
 
@@ -41,11 +42,23 @@ def test_package_lookup_failure_never_raises(monkeypatch: pytest.MonkeyPatch) ->
 def test_detect_tesseract_not_found_does_not_probe_version(monkeypatch: pytest.MonkeyPatch) -> None:
     _adapter_present(monkeypatch)
     monkeypatch.setattr("shutil.which", lambda executable: None)
+    monkeypatch.setattr("haydar.ocr._windows_tesseract_candidates", lambda: ())
     run = MagicMock()
     monkeypatch.setattr("subprocess.run", run)
 
     assert detect_tesseract() == TesseractInfo(TesseractStatus.NOT_FOUND, None, None)
     run.assert_not_called()
+
+
+def test_detect_tesseract_uses_windows_install_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    _adapter_present(monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda executable: None)
+    executable = tmp_path / "tesseract.exe"
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr("haydar.ocr._windows_tesseract_candidates", lambda: (executable,))
+    monkeypatch.setattr("subprocess.run", MagicMock(return_value=_result("tesseract 5.4.0")))
+
+    assert detect_tesseract() == TesseractInfo(TesseractStatus.FOUND, "5.4.0", str(executable))
 
 
 @pytest.mark.parametrize(
@@ -68,7 +81,13 @@ def test_detect_tesseract_found_for_realistic_versions(
 
     assert detect_tesseract() == TesseractInfo(TesseractStatus.FOUND, expected_version, path)
     run.assert_called_once_with(
-        [path, "--version"], capture_output=True, check=False, text=True, timeout=5
+        [path, "--version"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+        stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
@@ -141,10 +160,44 @@ def test_get_tesseract_path_uses_path_lookup(monkeypatch: pytest.MonkeyPatch) ->
     which.assert_called_once_with("tesseract")
 
 
-def test_get_install_instructions_are_actionable() -> None:
-    instructions = get_install_instructions()
+def test_get_install_instructions_describe_the_one_click_path() -> None:
+    """§19 forbids sending a normal user to pip, Winget, PATH, or the CLI.
 
-    assert "haydar[ocr]" in instructions
-    assert "https://github.com/UB-Mannheim/tesseract/wiki" in instructions
-    assert "winget install UB-Mannheim.TesseractOCR" in instructions
-    assert "restart Haydar" in instructions
+    The copy follows the manifest: with a reviewed asset it describes the
+    one-click install, and with none it describes installing the engine
+    manually. §19 was amended 2026-08-11 to permit that once one-click
+    provisioning proved undeliverable — withholding a fix that works is worse
+    than naming the engine. The package-manager and PATH bans still apply to
+    both states, and are asserted here.
+    """
+    from unittest.mock import patch
+
+    from haydar.ocr import OcrAsset
+
+    reviewed = OcrAsset(
+        version="5.5.3",
+        platform="windows",
+        architecture="x86_64",
+        url="https://example.invalid/ocr.zip",
+        archive_filename="ocr.zip",
+        sha256="a" * 64,
+        executable_relative_path="tesseract.exe",
+    )
+    with patch("haydar.ocr.OCR_ASSETS", (reviewed,)):
+        available = get_install_instructions().lower()
+    with patch("haydar.ocr.OCR_ASSETS", ()):
+        unavailable = get_install_instructions().lower()
+
+    assert "install ocr" in available
+    assert "indexed automatically" in available
+    # Names the engine and the one action that enables it, so the user is not
+    # left with "unavailable" and no route forward.
+    assert "tesseract" in unavailable
+    assert "restart haydar" in unavailable
+    assert "reindex" in unavailable
+
+    for lowered in (available, unavailable):
+        for forbidden in ("pip install", "winget", "path", "haydar-cli", "github.com"):
+            assert forbidden not in lowered
+        # Says plainly that files stay on the machine.
+        assert "never uploaded" in lowered

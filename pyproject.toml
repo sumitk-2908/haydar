@@ -62,10 +62,10 @@ haydar = "haydar.cli:app"
 haydar-ui = "haydar.cli:launch_ui"
 
 [project.urls]
-Homepage = "https://github.com/haydar-search/haydar"
+Homepage = "https://github.com/sumitk-2908/haydar"
 Documentation = "https://haydar.dev"
-Repository = "https://github.com/haydar-search/haydar"
-Issues = "https://github.com/haydar-search/haydar/issues"
+Repository = "https://github.com/sumitk-2908/haydar"
+Issues = "https://github.com/sumitk-2908/haydar/issues"
 
 [tool.hatch.version]
 path = "src/haydar/__init__.py"

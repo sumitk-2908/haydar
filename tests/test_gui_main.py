@@ -23,25 +23,24 @@ def mock_show_error():
 
 
 @pytest.fixture
-def mock_launch_window():
-    with patch("haydar.ui.window.launch_search_window") as mock_launch:
-        yield mock_launch
+def mock_gui_application():
+    with patch("haydar.ui.application.run_gui_application") as mock_run:
+        yield mock_run
 
 
-def test_main_uninitialized_shows_dialog(mock_config, mock_show_error, mock_launch_window):
+def test_main_uninitialized_enters_gui_setup(
+    mock_config, mock_show_error, mock_gui_application
+):
     mock_config.initialized = False
-    with pytest.raises(SystemExit) as exc:
-        main()
-    assert exc.value.code == 1
-    mock_show_error.assert_called_once()
-    title, msg = mock_show_error.call_args[0]
-    assert "Setup Required" in title
-    assert "haydar-cli.exe init" in msg
-    assert "haydar.log" in msg
-    mock_launch_window.assert_not_called()
+    mock_config.search_ready = False
+
+    main()
+
+    mock_show_error.assert_not_called()
+    mock_gui_application.assert_called_once_with(mock_config)
 
 
-def test_main_schema_mismatch_shows_dialog(mock_config, mock_show_error, mock_launch_window):
+def test_main_schema_mismatch_shows_dialog(mock_config, mock_show_error, mock_gui_application):
     mock_config.schema_version = CURRENT_SCHEMA_VERSION - 1
     with pytest.raises(SystemExit) as exc:
         main()
@@ -49,13 +48,50 @@ def test_main_schema_mismatch_shows_dialog(mock_config, mock_show_error, mock_la
     mock_show_error.assert_called_once()
     title, msg = mock_show_error.call_args[0]
     assert "Update Required" in title
-    assert "haydar-cli.exe reindex" in msg
+    # Recovery is in-app: a GUI user is never told to run the expert CLI.
+    assert "haydar-cli.exe" not in msg
+    assert "Rebuild index" in msg
     assert "haydar.log" in msg
-    mock_launch_window.assert_not_called()
+    mock_gui_application.assert_not_called()
 
 
-def test_main_fatal_error_shows_dialog(mock_config, mock_show_error, mock_launch_window):
-    mock_launch_window.side_effect = RuntimeError("boom")
+def test_main_future_schema_directs_to_the_newer_version(
+    mock_config, mock_show_error, mock_gui_application
+):
+    mock_config.schema_version = CURRENT_SCHEMA_VERSION + 1
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    title, msg = mock_show_error.call_args[0]
+    assert "Version Required" in title
+    assert "newer Haydar version" in msg
+    mock_gui_application.assert_not_called()
+
+
+def test_main_future_config_format_fails_closed(
+    mock_config, mock_show_error, mock_gui_application
+):
+    """A config from a newer build must not be rewritten by this one."""
+    from haydar.config import ConfigFormatError
+
+    with (
+        patch(
+            "haydar.config.HaydarConfig.load",
+            side_effect=ConfigFormatError(
+                "newer config", hint="Install the newer version."
+            ),
+        ),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    assert exc.value.code == 1
+    mock_show_error.assert_called_once()
+    mock_gui_application.assert_not_called()
+
+
+def test_main_fatal_error_shows_dialog(mock_config, mock_show_error, mock_gui_application):
+    mock_gui_application.side_effect = RuntimeError("boom")
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 1
@@ -65,11 +101,11 @@ def test_main_fatal_error_shows_dialog(mock_config, mock_show_error, mock_launch
     assert "haydar.log" in msg
 
 
-def test_main_successful_launch(mock_config, mock_show_error, mock_launch_window):
+def test_main_successful_launch(mock_config, mock_show_error, mock_gui_application):
     # Should not raise
     main()
     mock_show_error.assert_not_called()
-    mock_launch_window.assert_called_once_with(mock_config)
+    mock_gui_application.assert_called_once_with(mock_config)
 
 
 def test_show_error_dialog_failure_fallback(monkeypatch):

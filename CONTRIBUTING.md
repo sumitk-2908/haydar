@@ -8,7 +8,7 @@ one architectural rule that matters, and what a good PR looks like.
 Haydar is Windows-only and targets Python 3.11+.
 
 ```powershell
-git clone https://github.com/haydar-search/haydar.git
+git clone https://github.com/sumitk-2908/haydar.git
 cd haydar
 pip install -e .[dev,ocr]        # dev + OCR extras
 python scripts/pull-rg.py        # fetch + verify the ripgrep binary

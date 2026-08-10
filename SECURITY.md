@@ -41,7 +41,7 @@ SmartScreen warns on first launch — verify the published `.sha256` (see
 Please **do not** open a public GitHub issue for security reports.
 
 Instead, report privately via GitHub's
-[private vulnerability reporting](https://github.com/haydar-search/haydar/security/advisories/new)
+[private vulnerability reporting](https://github.com/sumitk-2908/haydar/security/advisories/new)
 (Security → Report a vulnerability). Include:
 
 - affected version and platform,

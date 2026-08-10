@@ -1,15 +1,15 @@
 # verify.ps1 - Verify a Haydar EXE against its published SHA-256 checksum.
 #
 # Usage:
-#   .\verify.ps1                       # verifies .\haydar-cli.exe
-#   .\verify.ps1 -Path .\haydar.exe    # verifies a specific EXE
+#   .\verify.ps1                           # verifies .\haydar.exe (the app)
+#   .\verify.ps1 -Path .\haydar-cli.exe    # verifies the optional expert CLI
 #
 # The matching "<name>.sha256" file must sit next to the EXE. Exit code 0 means
 # the download is intact; 1 means a mismatch or missing file.
 
 [CmdletBinding()]
 param(
-    [string]$Path = "haydar-cli.exe"
+    [string]$Path = "haydar.exe"
 )
 
 $ErrorActionPreference = "Stop"

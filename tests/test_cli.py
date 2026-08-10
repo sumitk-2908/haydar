@@ -6,9 +6,33 @@ from typer.testing import CliRunner
 
 from haydar.cli import app
 from haydar.config import HaydarConfig
+from haydar.indexer.engine import IndexSnapshot, JobOutcome, JobPhase
 from haydar.ocr import TesseractInfo, TesseractStatus
 
 runner = CliRunner()
+
+
+def _init_patches(tmp_path, info, config=None):
+    """Patch the seams `init` actually uses: setup, the engine, and OCR detection.
+
+    ``init`` now runs setup and the index job as separate steps, so the fakes
+    stand in for the coordinator and engine rather than a single ``index_all``.
+    """
+    config = config or HaydarConfig(folders=[str(tmp_path)])
+    engine = MagicMock()
+    engine.__enter__.return_value.run_job.return_value = IndexSnapshot(
+        run_id="test",
+        phase=JobPhase.COMPLETE,
+        outcome=JobOutcome.COMPLETE,
+        committed_files=1,
+    )
+    return config, engine, (
+        patch("haydar.cli.HaydarConfig.load", return_value=config),
+        patch("haydar.cli.HaydarConfig.save"),
+        patch("haydar.setup.SetupCoordinator.prepare_search", return_value=config),
+        patch("haydar.cli.detect_tesseract", return_value=info),
+        patch("haydar.indexer.engine.IndexingEngine", return_value=engine),
+    )
 
 
 def test_cli_help():
@@ -18,24 +42,37 @@ def test_cli_help():
 
 
 def test_cli_init_yes(tmp_path):
-    engine = MagicMock()
-    engine.__enter__.return_value.index_all.return_value = {}
-    with (
-        patch("haydar.cli.HaydarConfig.load") as mock_load,
-        patch("haydar.cli.HaydarConfig.save"),
-        patch("haydar.cli._ensure_ripgrep"),
-        patch(
-            "haydar.cli.detect_tesseract",
-            return_value=TesseractInfo(TesseractStatus.FOUND, "5.3.1", "C:/Tesseract/tesseract.exe"),
-        ),
-        patch("haydar.indexer.engine.IndexingEngine", return_value=engine),
-    ):
-        mock_config = HaydarConfig()
-        mock_config.folders = [str(tmp_path)]
-        mock_load.return_value = mock_config
-
+    _config, _engine, patches = _init_patches(
+        tmp_path,
+        TesseractInfo(TesseractStatus.FOUND, "5.3.1", "C:/Tesseract/tesseract.exe"),
+    )
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
         result = runner.invoke(app, ["init", "--yes"])
-        assert result.exit_code == 0
+
+    assert result.exit_code == 0
+
+
+def test_init_directs_normal_users_to_the_gui(tmp_path):
+    """The CLI is an expert interface; it must not present itself as the path."""
+    _config, _engine, patches = _init_patches(
+        tmp_path,
+        TesseractInfo(TesseractStatus.FOUND, "5.3.1", "C:/Tesseract/tesseract.exe"),
+    )
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        result = runner.invoke(app, ["init", "--yes"])
+
+    assert "haydar.exe" in result.stdout
+
+
+def test_init_persists_the_lifecycle_through_to_complete(tmp_path):
+    config, _engine, patches = _init_patches(
+        tmp_path,
+        TesseractInfo(TesseractStatus.FOUND, "5.3.1", "C:/Tesseract/tesseract.exe"),
+    )
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        runner.invoke(app, ["init", "--yes"])
+
+    assert config.initial_index_state == "complete"
 
 
 @pytest.mark.parametrize(
@@ -54,12 +91,6 @@ def test_ocr_status_reports_each_readiness_state(info, expected):
 
     assert result.exit_code == 0
     assert expected in result.stdout
-    if info.status in {
-        TesseractStatus.PYTHON_PACKAGE_MISSING,
-        TesseractStatus.NOT_FOUND,
-        TesseractStatus.WRONG_VERSION,
-    }:
-        assert 'pip install "haydar[ocr]"' in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -73,15 +104,8 @@ def test_ocr_status_reports_each_readiness_state(info, expected):
     ],
 )
 def test_init_reports_each_ocr_readiness_state(tmp_path, info, expected):
-    engine = MagicMock()
-    engine.__enter__.return_value.index_all.return_value = {}
-    with (
-        patch("haydar.cli.HaydarConfig.load", return_value=HaydarConfig(folders=[str(tmp_path)])),
-        patch("haydar.cli.HaydarConfig.save"),
-        patch("haydar.cli._ensure_ripgrep"),
-        patch("haydar.cli.detect_tesseract", return_value=info),
-        patch("haydar.indexer.engine.IndexingEngine", return_value=engine),
-    ):
+    _config, _engine, patches = _init_patches(tmp_path, info)
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
         result = runner.invoke(app, ["init", "--yes"])
 
     assert result.exit_code == 0
@@ -187,3 +211,84 @@ def test_update_check_snooze_only_suppresses_without_force(force):
     else:
         get_latest.assert_not_called()
         assert "dismissed temporarily" in result.stdout
+
+
+# -- readiness gating -------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [["search", "q"], ["reindex", "--yes"], ["watch"]])
+def test_commands_refuse_before_search_is_ready(command):
+    """Gating is on search readiness, never on the legacy initialized flag."""
+    config = HaydarConfig(folders=[r"C:\Docs"], search_ready=False)
+    with patch("haydar.cli.HaydarConfig.load", return_value=config):
+        result = runner.invoke(app, command)
+
+    assert result.exit_code == 1
+    assert "haydar.exe" in result.stdout
+
+
+@pytest.mark.parametrize("state", ["not_started", "running", "paused"])
+def test_search_works_while_the_initial_index_is_incomplete(state):
+    """A partial index is a valid state to search."""
+    config = HaydarConfig(
+        folders=[r"C:\Docs"], search_ready=True, initial_index_state=state
+    )
+    search = MagicMock()
+    search.return_value.search.return_value = []
+    with (
+        patch("haydar.cli.HaydarConfig.load", return_value=config),
+        patch("haydar.search.hybrid.HybridSearch", search),
+    ):
+        result = runner.invoke(app, ["search", "budget"])
+
+    assert result.exit_code == 0
+    assert state in result.stdout
+
+
+@pytest.mark.parametrize("state", ["not_started", "running", "paused"])
+def test_watch_refuses_while_the_initial_index_is_unsafe(state):
+    """The watcher gate is never bypassed: it would race the crawl for the lock."""
+    config = HaydarConfig(
+        folders=[r"C:\Docs"], search_ready=True, initial_index_state=state
+    )
+    watcher = MagicMock()
+    with (
+        patch("haydar.cli.HaydarConfig.load", return_value=config),
+        patch("haydar.indexer.watcher.FileWatcher", watcher),
+    ):
+        result = runner.invoke(app, ["watch"])
+
+    assert result.exit_code == 1
+    assert watcher.call_count == 0
+    assert "cannot start yet" in result.stdout
+
+
+@pytest.mark.parametrize("state", ["complete", "cancelled", "failed"])
+def test_watch_starts_after_a_safe_terminal_state(state):
+    config = HaydarConfig(
+        folders=[r"C:\Docs"], search_ready=True, initial_index_state=state
+    )
+    watcher = MagicMock()
+    with (
+        patch("haydar.cli.HaydarConfig.load", return_value=config),
+        patch("haydar.indexer.watcher.FileWatcher", watcher),
+    ):
+        result = runner.invoke(app, ["watch"])
+
+    assert result.exit_code == 0
+    watcher.return_value.start.assert_called_once_with(blocking=True)
+
+
+def test_status_reports_readiness_without_requiring_a_ready_index():
+    config = HaydarConfig(
+        folders=[r"C:\Docs"],
+        folders_configured=True,
+        search_ready=False,
+        initial_index_state="paused",
+    )
+    with patch("haydar.cli.HaydarConfig.load", return_value=config):
+        result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert "paused" in result.stdout
+    assert "Watcher eligible" in result.stdout

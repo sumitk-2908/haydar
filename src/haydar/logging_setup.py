@@ -19,9 +19,18 @@ from haydar.config import LOG_DIR
 _LOG_FILE = LOG_DIR / "haydar.log"
 _MAX_BYTES = 2 * 1024 * 1024  # 2 MB
 _BACKUP_COUNT = 3
-_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+_FORMAT = "%(asctime)s [%(run_id)s] %(levelname)-8s %(name)s: %(message)s"
 
 _configured = False
+
+
+class _RunIdFilter(logging.Filter):
+    """Ensure every formatted record has a correlation identifier."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "run_id"):
+            record.run_id = "--------"
+        return True
 
 
 def setup_logging(level: int = logging.INFO, console: bool = True) -> None:
@@ -44,7 +53,10 @@ def setup_logging(level: int = logging.INFO, console: bool = True) -> None:
     root.setLevel(level)
 
     formatter = logging.Formatter(_FORMAT)
+    run_id_filter = _RunIdFilter()
+    root.addFilter(run_id_filter)
 
+    # Filters on handlers also process records propagated from child loggers.
     # File handler (rotating). Failure to create it must not crash the app.
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,6 +68,7 @@ def setup_logging(level: int = logging.INFO, console: bool = True) -> None:
         )
         file_handler.setFormatter(formatter)
         file_handler.setLevel(level)
+        file_handler.addFilter(run_id_filter)
         root.addHandler(file_handler)
     except OSError as exc:  # pragma: no cover - defensive
         logging.getLogger(__name__).warning(
@@ -67,6 +80,7 @@ def setup_logging(level: int = logging.INFO, console: bool = True) -> None:
         console_handler.setFormatter(formatter)
         # Keep the console quieter than the file to avoid noise in the terminal.
         console_handler.setLevel(logging.WARNING)
+        console_handler.addFilter(run_id_filter)
         root.addHandler(console_handler)
 
     _configured = True

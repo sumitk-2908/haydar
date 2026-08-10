@@ -11,9 +11,10 @@ from haydar.ui.window import SearchWindow
 
 
 @pytest.fixture(autouse=True)
-def disable_update_check(monkeypatch):
+def disable_background_checks(monkeypatch):
     """Keep focused window tests deterministic and free of one-shot Qt threads."""
     monkeypatch.setattr(SearchWindow, "_start_update_check", lambda self: None)
+    monkeypatch.setattr(SearchWindow, "_start_staleness_check", lambda self: None)
 
 
 @pytest.fixture
@@ -124,6 +125,28 @@ def test_settings_integration(qtbot, tmp_haydar, config, monkeypatch):
 
     window.close()
     settings_window.close()
+
+def test_staleness_banner_shows_and_dismisses(qtbot, tmp_haydar, config, monkeypatch):
+    _disable_search_engine(monkeypatch)
+    window = SearchWindow(config)
+    qtbot.addWidget(window)
+    try:
+        initial_height = window.height()
+        window._on_staleness_result(7)
+
+        assert not window._staleness_banner.isHidden()
+        assert window._staleness_label.text() == (
+            "~7 files may be unindexed. "
+            "Run haydar watch to keep results current."
+        )
+        assert window.height() == initial_height + 40
+
+        qtbot.mouseClick(window._dismiss_staleness_btn, Qt.LeftButton)
+        assert window._staleness_banner.isHidden()
+        assert window.height() == initial_height
+    finally:
+        window.close()
+
 
 def _disable_search_engine(monkeypatch):
     def unavailable(self, config):

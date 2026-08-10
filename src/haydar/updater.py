@@ -8,8 +8,8 @@ from packaging.version import InvalidVersion, Version
 
 from haydar import __version__
 
-RELEASES_API = "https://api.github.com/repos/haydar-search/haydar/releases/latest"
-RELEASES_BASE = "https://github.com/haydar-search/haydar/releases/tag"
+RELEASES_API = "https://api.github.com/repos/sumitk-2908/haydar/releases/latest"
+RELEASES_BASE = "https://github.com/sumitk-2908/haydar/releases/tag"
 _MAX_RESPONSE_BYTES = 1024 * 1024
 
 logger = logging.getLogger(__name__)

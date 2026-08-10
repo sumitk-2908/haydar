@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
 import haydar
 from haydar.config import HaydarConfig
 from haydar.search.hybrid import HybridSearch, SearchResult
+from haydar.search.staleness import estimate_unindexed_count
 from haydar.ui.hotkey import HotkeyListener
+from haydar.ui.index_status import IndexStatusBand
 from haydar.ui.results import ResultsList
 from haydar.ui.theme import ThemeColors
 from haydar.updater import get_latest_version, get_release_url, is_newer
@@ -69,6 +71,24 @@ class UpdateCheckWorker(QObject):
             logging.getLogger(__name__).exception("Background update check failed")
         finally:
             self.finished.emit()
+
+class _StalenessWorker(QObject):
+    result_ready = Signal(int)
+    finished = Signal()
+
+    def __init__(self, config: HaydarConfig):
+        super().__init__()
+        self.config = config
+
+    def run(self) -> None:
+        try:
+            count = estimate_unindexed_count(self.config.folders, self.config)
+            self.result_ready.emit(count)
+        except Exception:
+            logging.getLogger(__name__).exception("Background staleness check failed")
+        finally:
+            self.finished.emit()
+
 
 class SearchWorker(QObject):
     finished = Signal(list)
@@ -140,6 +160,8 @@ class SearchWindow(QWidget):
         self._hotkey_listener = None
         self._settings_window = None
         self._whatsnew_banner: QWidget | None = None
+        self._staleness_thread: QThread | None = None
+        self._staleness_worker: _StalenessWorker | None = None
 
         # Setup UI properties
         flags = Qt.FramelessWindowHint | Qt.Tool
@@ -180,6 +202,7 @@ class SearchWindow(QWidget):
             self.search_thread.start()
 
         self.setup_ui()
+        self._start_staleness_check()
 
         self._update_thread: QThread | None = None
         self._update_worker: UpdateCheckWorker | None = None
@@ -263,6 +286,32 @@ class SearchWindow(QWidget):
         self._update_banner.hide()
         container_layout.addWidget(self._update_banner)
 
+        self._staleness_banner = QWidget()
+        self._staleness_banner.setObjectName("stalenessBanner")
+        self._staleness_banner.setStyleSheet(
+            "border: 1px solid rgba(234,179,8,0.4); "
+            "border-radius: 6px; padding: 4px 8px;"
+        )
+        staleness_layout = QHBoxLayout(self._staleness_banner)
+        staleness_layout.setContentsMargins(0, 0, 0, 0)
+        self._staleness_label = QLabel()
+        self._staleness_label.setTextFormat(Qt.PlainText)
+        self._staleness_label.setWordWrap(True)
+        self._staleness_label.setStyleSheet("border: none;")
+        self._staleness_label.setAccessibleName("Index freshness status")
+        self._dismiss_staleness_btn = QPushButton("×")
+        self._dismiss_staleness_btn.setObjectName("dismissStalenessButton")
+        self._dismiss_staleness_btn.setAccessibleName("Dismiss index freshness warning")
+        self._dismiss_staleness_btn.setStyleSheet(
+            "border: none; font-weight: bold; font-size: 16px; "
+            "padding: 0 4px; background: transparent;"
+        )
+        self._dismiss_staleness_btn.clicked.connect(self._dismiss_staleness)
+        staleness_layout.addWidget(self._staleness_label)
+        staleness_layout.addStretch()
+        staleness_layout.addWidget(self._dismiss_staleness_btn)
+        self._staleness_banner.hide()
+
         # Search input, mode, and settings are layout-owned so system font and
         # style changes cannot cause the settings control to overlap content.
         search_layout = QHBoxLayout()
@@ -332,6 +381,11 @@ class SearchWindow(QWidget):
         search_layout.addWidget(self.settings_btn)
 
         container_layout.addLayout(search_layout)
+        container_layout.addWidget(self._staleness_banner)
+
+        self.index_band = IndexStatusBand()
+        self.index_band.hide()
+        container_layout.addWidget(self.index_band)
 
         # Scroll area for results
         self.scroll_area = QScrollArea()
@@ -388,6 +442,10 @@ class SearchWindow(QWidget):
 
         main_layout.addWidget(self.container)
 
+        # The band owns its own progress indicator, driven by job snapshots
+        # rather than by polling for a lock file.
+        main_layout.addWidget(self.index_band.progress)
+
         QWidget.setTabOrder(self.search_input, self.mode_btn)
         QWidget.setTabOrder(self.mode_btn, self._download_btn)
         QWidget.setTabOrder(self._download_btn, self._dismiss_btn)
@@ -429,8 +487,12 @@ class SearchWindow(QWidget):
         # child's explicit state and therefore also works during construction.
         if not self._update_banner.isHidden():
             extra_height += self._update_banner.sizeHint().height() + 12
+        if not self._staleness_banner.isHidden():
+            extra_height += 40
         if self._whatsnew_banner is not None and not self._whatsnew_banner.isHidden():
             extra_height += 40
+        if not self.index_band.isHidden():
+            extra_height += self.index_band.sizeHint().height() + 8
         if not self.status_label.isHidden():
             one_line_height = self.status_label.fontMetrics().lineSpacing()
             # The error baseline reserves room for the message, log path, and
@@ -444,6 +506,56 @@ class SearchWindow(QWidget):
             )
         self._set_logical_size(
             self._logical_width(screen), base_height + extra_height, screen
+        )
+
+    def set_indexing_status(self, message: str | None) -> None:
+        """Show a plain indexing message.
+
+        Retained for callers that only need to display text; structured job
+        state goes through ``index_band.update_snapshot`` instead.
+        """
+        if message:
+            self.index_band.show_message(message)
+        else:
+            self.index_band.collapse()
+        self.refresh_layout()
+
+    def refresh_layout(self) -> None:
+        """Recompute window height after a banner or the status band changes."""
+        self._set_content_height(
+            getattr(self, "_current_base_height", self.BASE_EMPTY_HEIGHT)
+        )
+
+    def _start_staleness_check(self) -> None:
+        """Estimate index staleness without delaying window construction."""
+        thread = QThread(self)
+        worker = _StalenessWorker(self.config)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result_ready.connect(self._on_staleness_result)
+        worker.finished.connect(thread.quit)
+        self._staleness_thread = thread
+        self._staleness_worker = worker
+        thread.start()
+
+    def _on_staleness_result(self, count: int) -> None:
+        if count <= 0:
+            return
+        message = (
+            f"~{count} files may be unindexed. "
+            "Run haydar watch to keep results current."
+        )
+        self._staleness_label.setText(message)
+        self._staleness_label.setAccessibleDescription(message)
+        self._staleness_banner.show()
+        self._set_content_height(
+            getattr(self, "_current_base_height", self.BASE_EMPTY_HEIGHT)
+        )
+
+    def _dismiss_staleness(self) -> None:
+        self._staleness_banner.hide()
+        self._set_content_height(
+            getattr(self, "_current_base_height", self.BASE_EMPTY_HEIGHT)
         )
 
     def _start_update_check(self) -> None:
@@ -706,6 +818,14 @@ class SearchWindow(QWidget):
         event.accept()
 
     def closeEvent(self, event):
+        if self._staleness_thread is not None:
+            self._staleness_thread.quit()
+            self._staleness_thread.wait()
+            if self._staleness_worker is not None:
+                self._staleness_worker.deleteLater()
+            self._staleness_thread.deleteLater()
+            self._staleness_worker = None
+            self._staleness_thread = None
         if self._update_thread is not None:
             self._update_thread.quit()
             self._update_thread.wait()
@@ -850,33 +970,34 @@ class SearchWindow(QWidget):
         return True
 
 
-def launch_search_window(config: HaydarConfig):
-    import logging
+def create_search_window(config: HaydarConfig) -> SearchWindow:
+    """Construct and wire search/settings UI inside an existing Qt application."""
+    window = SearchWindow(config)
 
+    from haydar.ui.settings import SettingsWindow
+
+    settings_window = SettingsWindow(config)
+    settings_window.config_changed.connect(window.on_config_changed)
+    window.set_settings_window(settings_window)
+    window._restart_hotkey(config.hotkey)
+    return window
+
+
+def launch_search_window(config: HaydarConfig):
+    """Compatibility launcher for callers that do not own a Qt event loop."""
     from haydar.logging_setup import setup_logging
 
-    # Windowed GUI has no console; persist logs to file only.
     setup_logging(console=False)
     logger = logging.getLogger(__name__)
 
     try:
-        # Qt 6 already uses logical pixels; never multiply widget geometry by DPR.
         _configure_qt_dpi_policy()
-        app = QApplication(sys.argv)
-
-        font = QFont("Inter", 10)
-        app.setFont(font)
-
-        window = SearchWindow(config)
-
-        from haydar.ui.settings import SettingsWindow
-        settings_window = SettingsWindow(config)
-        settings_window.config_changed.connect(window.on_config_changed)
-        window.set_settings_window(settings_window)
-
-        window._restart_hotkey(config.hotkey)
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setFont(QFont("Inter", 10))
+        window = create_search_window(config)
 
         got_sigint = False
+
         def sigint_handler(signum, frame):
             nonlocal got_sigint
             got_sigint = True
@@ -887,7 +1008,6 @@ def launch_search_window(config: HaydarConfig):
         timer = QTimer()
         timer.timeout.connect(lambda: None)
         timer.start(200)
-
         window.toggle()
 
         try:

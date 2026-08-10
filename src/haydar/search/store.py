@@ -105,6 +105,35 @@ class VectorStore:
             message, hint = _classify_storage_error(exc, "collection initialization")
             raise VectorStoreError(message, hint=hint) from exc
 
+    def embed_probe(self, text: str = "haydar embedding probe") -> int:
+        """Prove the configured model can actually embed text; return its dimension.
+
+        Constructing the embedding function is not sufficient evidence that the
+        model is usable — a partially downloaded snapshot can import cleanly and
+        then fail on first use. Setup calls this so that failure surfaces during
+        provisioning rather than on the user's first search.
+        """
+        vectors = self.embedding_function([text])
+        if not vectors or len(vectors) != 1 or len(vectors[0]) == 0:
+            raise VectorStoreError(
+                f"The embedding model '{self.config.embedding_model}' returned no "
+                "usable output.",
+                hint="Try setup again to re-download the model.",
+            )
+        return len(vectors[0])
+
+    def verify_readable(self) -> None:
+        """Run bounded count and query capability checks against the collection.
+
+        This never writes and never clears: an existing user's index must be
+        readable after an upgrade without being rebuilt.
+        """
+        self.collection.count()
+        # A query against an empty collection is valid and returns no ids, which
+        # is exactly the check we want: it exercises the read path end to end
+        # without depending on any indexed content.
+        self.collection.query(query_texts=["haydar readiness probe"], n_results=1)
+
     def add_documents(self, ids: list[str], documents: list[str], metadatas: list[dict]) -> None:
         """Add documents to the collection."""
         if not ids:

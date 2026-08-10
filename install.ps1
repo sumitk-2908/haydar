@@ -1,7 +1,11 @@
 # install.ps1 - transactionally download, verify, and install Haydar on Windows.
+#
+# Installs haydar.exe, the desktop application, plus the optional haydar-cli.exe
+# expert command line. Launching haydar.exe is all that is needed afterwards: it
+# performs first-run setup itself and never requires the command line.
 [CmdletBinding()]
 param(
-    [string]$Repo = "haydar-search/haydar",
+    [string]$Repo = "sumitk-2908/haydar",
     [string]$Version = "latest",
     [switch]$Yes
 )
@@ -50,16 +54,22 @@ function Get-ExeVersion ([string]$path) {
 }
 
 $installDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Haydar" } else { throw "LOCALAPPDATA is not available." }
+$guiPath = Join-Path $installDir "haydar.exe"
 $cliPath = Join-Path $installDir "haydar-cli.exe"
+# haydar.exe leads: it is the asset a normal user needs, and the only one they
+# have to run. The CLI follows as the optional expert interface.
 $assets = @("haydar.exe", "haydar.exe.sha256", "haydar-cli.exe", "haydar-cli.exe.sha256")
 
-if (Test-Path -LiteralPath $cliPath) {
+if ((Test-Path -LiteralPath $guiPath) -or (Test-Path -LiteralPath $cliPath)) {
+    # Read the version from the console binary: haydar.exe is windowed, so
+    # running it for a version string would flash a window rather than print.
     $installedVersion = Get-ExeVersion $cliPath
     if ($installedVersion) { Write-Host "Found existing installation: v$installedVersion" -ForegroundColor Cyan }
-    else { Write-Host "Found existing installation at $cliPath (version unknown)." -ForegroundColor Yellow }
+    else { Write-Host "Found existing installation in $installDir (version unknown)." -ForegroundColor Yellow }
     if ($Version -ne "latest" -and $installedVersion -eq (Normalize-Version $Version)) {
         Write-Host "The requested version is already installed." -ForegroundColor Yellow
     }
+    Write-Host "Your indexed data and settings in %USERPROFILE%\.haydar are kept." -ForegroundColor DarkGray
 
     if (-not $Yes) {
         $interactive = $true
@@ -136,13 +146,17 @@ try {
     if (-not $present) {
         $newPath = if ([string]::IsNullOrEmpty($userPath)) { $installDir } else { "$userPath;$installDir" }
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        Write-Host "Added $installDir to user PATH; restart the shell to pick it up." -ForegroundColor Cyan
+        Write-Host "Added $installDir to your user PATH so 'haydar' works from a terminal." -ForegroundColor DarkGray
     }
 
     $finalVersion = Get-ExeVersion $cliPath
     if ($finalVersion) { Write-Host "Installed Haydar v$finalVersion to $installDir." -ForegroundColor Green }
     else { Write-Host "Installed Haydar to $installDir." -ForegroundColor Green }
-    Write-Host "Run 'haydar-cli.exe init' to set up your index." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Launch Haydar:" -ForegroundColor Green
+    Write-Host "  $guiPath" -ForegroundColor Green
+    Write-Host "It sets itself up on first launch and opens search as soon as it is ready." -ForegroundColor DarkGray
+    Write-Host "haydar-cli.exe was also installed; it is optional, for automation and scripting." -ForegroundColor DarkGray
 } catch {
     Write-Error $_
     exit 1

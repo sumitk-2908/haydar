@@ -34,6 +34,11 @@ def _enable_windows_dpi_awareness() -> None:
 
 def _show_error_dialog(title: str, message: str) -> None:
     """Safely show a native Windows error dialog, ignoring failures."""
+    if _report_probe_failure(f"{title}: {message}"):
+        # A probe run is unattended. A modal dialog would block until someone
+        # dismissed it, turning a startup failure into a hung CI step, so the
+        # failure is written to the report instead.
+        return
     if sys.platform != "win32":
         return
     try:
@@ -45,27 +50,52 @@ def _show_error_dialog(title: str, message: str) -> None:
         pass
 
 
+def _report_probe_failure(detail: str) -> bool:
+    """Record a fatal startup failure for the packaged-startup probe.
+
+    Returns whether this process is a probe run, so callers know the failure has
+    been reported and no dialog is wanted. Import failures are swallowed: if the
+    probe machinery itself cannot load, the launcher still sees a missing report
+    and a nonzero exit, which is the same verdict.
+    """
+    try:
+        from haydar.startup_probe import StartupReport, is_probing, write_report
+
+        if not is_probing():
+            return False
+        write_report(StartupReport(errors=[detail]))
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
     _enable_windows_dpi_awareness()
     logger = logging.getLogger(__name__)
 
     try:
-        from haydar.config import CURRENT_SCHEMA_VERSION, HaydarConfig, get_log_path
+        from haydar.config import (
+            CURRENT_SCHEMA_VERSION,
+            ConfigFormatError,
+            HaydarConfig,
+            get_log_path,
+        )
         from haydar.logging_setup import setup_logging
 
         # Logging initialization is inside the fatal boundary: even a handler or
         # import failure receives the native no-console fallback below.
         setup_logging(console=False)
-        config = HaydarConfig.load()
-        if not config.initialized:
-            logger.error("Haydar is not initialized. Run `haydar init` first.")
-            msg = (
-                "Haydar is not initialized.\n\n"
-                "Please run `haydar-cli.exe init` to set up the index and download "
-                "the required model (approx 90MB).\n\n"
-                f"Full log: {get_log_path()}"
+
+        try:
+            config = HaydarConfig.load()
+        except ConfigFormatError as exc:
+            # Fail closed: rewriting a newer config would drop fields this build
+            # cannot maintain. Neither config nor index is touched.
+            logger.error("Unsupported config format: %s", exc)
+            _show_error_dialog(
+                "Haydar Version Required",
+                f"{exc}\n\n{exc.hint or ''}\n\nFull log: {get_log_path()}",
             )
-            _show_error_dialog("Haydar Setup Required", msg)
             sys.exit(1)
 
         schema_version = getattr(config, "schema_version", 0)
@@ -90,16 +120,17 @@ def main() -> None:
                 CURRENT_SCHEMA_VERSION,
             )
             msg = (
-                "The search index format has changed and needs to be updated.\n\n"
-                "Please run `haydar-cli.exe reindex`. Your files will not be affected.\n\n"
+                "The search index format has changed and needs to be rebuilt.\n\n"
+                "Open Haydar settings and choose Rebuild index. Your files will "
+                "not be affected.\n\n"
                 f"Full log: {get_log_path()}"
             )
             _show_error_dialog("Haydar Update Required", msg)
             sys.exit(1)
 
-        from haydar.ui.window import launch_search_window
+        from haydar.ui.application import run_gui_application
 
-        launch_search_window(config)
+        run_gui_application(config)
     except KeyboardInterrupt:
         pass
     except Exception:
