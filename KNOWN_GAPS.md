@@ -15,9 +15,9 @@ Haydar ships the full provisioning transaction — pinned manifest, streamed
 download, constant-time SHA-256 comparison, member-by-member extraction,
 executable probe, atomic activation (`src/haydar/ocr.py`). What it does *not*
 ship is a pinned asset for it to install, because a licensing and integrity
-review on 2026-08-10 found no Windows Tesseract distribution that clears §15 of
-the product contract ("do not bundle an unlicensed/unreviewed native OCR
-archive"):
+review on 2026-08-10 found no Windows Tesseract distribution that satisfies the
+product contract's distribution rule ("do not bundle an unlicensed/unreviewed
+native OCR archive"):
 
 - Upstream publishes exactly one Windows artifact per release, an NSIS `.exe`
   installer. It bundles pango (LGPL-2.1, pulling glib2 and cairo) while shipping
@@ -42,16 +42,24 @@ one without modifying it. Images encountered while OCR is unavailable are
 recorded as `ocr_deferred`, never as processed, so they are picked up by an
 image-only backfill if an engine appears later — no reindex.
 
-**This is now documented to users (§19 amended 2026-08-11).** §19 originally
-forbade directing users to a manual OCR installation, on the assumption that
-one-click provisioning would ship. Since it does not, that ban left "not
-available in this build" as the whole story while a working route existed. The
-docs, `get_install_instructions()`, and the Settings dialog now name Tesseract,
-state the v4+/English-language-data requirements, and say to restart Haydar.
-Package managers, third-party mirrors, and PATH edits remain forbidden, with
-wider assertions in `test_docs_contract.py`. Full rationale and the revert path
-are in the §19 amendment note in
-`docs/first-run-product-contract-handoff.md`.
+**This is now documented to users (rule amended 2026-08-11).** The docs rule
+originally forbade directing users to a manual OCR installation, on the
+assumption that one-click provisioning would ship. Since it does not, that ban
+left "not available in this build" as the whole story while a working route
+existed. The docs, `get_install_instructions()`, and the Settings dialog now name
+Tesseract, state the v4+/English-language-data requirements, and say to restart
+Haydar. Package managers, third-party mirrors, and PATH edits remain forbidden,
+with wider assertions in `test_docs_contract.py`.
+
+The amendment is narrow. Permitted: naming Tesseract, stating its v4+ and
+English-language-data requirements, and linking the Tesseract project's own
+installer. Still forbidden: package-manager invocations (`winget`, `choco`,
+`scoop`), third-party mirrors such as UB-Mannheim, PATH edits, `pip install`, and
+making `haydar-cli.exe` the normal path. Detection reads `PATH` and the default
+install directories, so the copy stops at "install it, restart Haydar" and never
+asks a user to wire anything up. Reverting the amendment is a copy change plus
+the assertions in `test_ocr.py`, `test_settings.py`, `test_ocr_provisioning.py`,
+and `test_docs_contract.py`.
 
 **Constraint on any revisit.** The amendment is scoped to the unreviewed state.
 If an asset is ever pinned, the one-click copy must stay engine-agnostic —
@@ -65,9 +73,8 @@ record the outcome in `THIRD_PARTY_NOTICES.md`, then set `url`/`sha256` in
 already reviewed and pinned (Apache-2.0, commit-pinned, downloaded and hashed
 during the review), so the language-data half needs no further work.
 
-Full findings: `docs/first-run-product-contract-handoff.md` §0 ("OCR asset
-review"), the review comment above `OCR_ASSETS` in `src/haydar/ocr.py`, and the
-Tesseract section of `THIRD_PARTY_NOTICES.md`.
+Full findings: the review comment above `OCR_ASSETS` in `src/haydar/ocr.py` and
+the Tesseract section of `THIRD_PARTY_NOTICES.md`.
 
 ---
 
