@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update checks queried a repository that does not exist, so no update was ever reported. All release, install, and verify scripts now point at the real repository.
 - OCR version probes failed inside the windowed `haydar.exe` with "the handle is invalid", because the console-less process passed an inherited standard handle to the child.
 - Deferred Qt callbacks could reach a status band whose underlying object had already been destroyed by a window close, raising inside the event loop.
+- Deferred callbacks are now bound to the lifetime of the object that scheduled them, not just guarded at the far end. A pending timer whose own receiver had been destroyed previously ran against freed memory rather than raising.
+- Closing Settings while Tesseract detection was still running stranded the detection thread for the life of the process. Detection is deliberately allowed to outlive the window, but it now ends its own event loop instead of waiting for a call the closed window could no longer deliver.
 - An OCR backfill replayed the previous engine's text, because extraction served a content-keyed cache entry before dispatching to OCR — the bytes are unchanged on a re-OCR, but the engine is not.
 - A corrupt `config.json` is now preserved alongside the replacement instead of being silently overwritten with defaults.
 - Error-state window sizing is stable across Qt versions.
