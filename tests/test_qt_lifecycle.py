@@ -410,6 +410,39 @@ def test_the_completion_collapse_survives_a_closed_window(qtbot, tmp_haydar):
         ctrl._subscription.cancel()
 
 
+def test_a_destroyed_controller_drops_its_deferred_initial_index(controller, monkeypatch):
+    """Deferred work must not outlive the controller that scheduled it.
+
+    ``_show_search`` defers the initial index to the next event-loop turn. Given a
+    ``QTimer.singleShot`` with no context object, that pending call is bound to
+    nothing and still fires after the controller's C++ side is destroyed. The
+    guards inside the callbacks cannot help: the call never gets that far.
+
+    It also lands wherever the loop is next pumped, which in a test session is
+    pytest-qt's post-test ``processEvents``. That reported an access violation
+    against an unrelated test in tests/test_qt_lifecycle.py on CI (3.11,
+    2026-08-11) rather than against whichever test leaked the timer.
+    """
+    from shiboken6 import delete
+
+    started = []
+    monkeypatch.setattr(
+        GuiApplicationController,
+        "_start_initial_index",
+        lambda self: started.append(True),
+    )
+    ctrl, _window = controller(_ready_config(initial_index_state="complete"))
+    ctrl.start()
+    assert started == [], "the initial index must be deferred, not run inline"
+
+    if ctrl._subscription is not None:
+        ctrl._subscription.cancel()
+    delete(ctrl)
+    QApplication.instance().processEvents()
+
+    assert started == [], "a destroyed controller still ran its deferred start"
+
+
 def test_a_late_snapshot_does_not_touch_a_destroyed_band(qtbot, tmp_haydar):
     """Snapshots arrive from a worker thread and can lose the race with close."""
     ctrl, _window = _controller_with_disposable_band(_ready_config(), qtbot)

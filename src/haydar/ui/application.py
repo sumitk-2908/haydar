@@ -168,7 +168,11 @@ class GuiApplicationController(QObject):
 
         self._subscription = self.service.subscribe(self.snapshot_received.emit)
         # Start on the next event-loop turn so the window is interactive first.
-        QTimer.singleShot(0, self._start_initial_index)
+        # `self` is passed as the timer's context object so Qt cancels the pending
+        # call if this controller is destroyed first. Without a context the call
+        # is bound to nothing and still fires after the C++ side is gone, which
+        # is a use-after-free rather than an exception the guards below can catch.
+        QTimer.singleShot(0, self, self._start_initial_index)
 
     def _wire_status_controls(self, window: SearchWindow) -> None:
         band = getattr(window, "index_band", None)
@@ -205,7 +209,10 @@ class GuiApplicationController(QObject):
 
         if snapshot.outcome is not None:
             if snapshot.outcome is JobOutcome.COMPLETE:
-                QTimer.singleShot(COMPLETE_COLLAPSE_MS, self._collapse_status)
+                # Context object, so a controller destroyed inside this six-second
+                # window cancels the callback instead of being called after free.
+                # `_collapse_status` still guards the band, which can die on its own.
+                QTimer.singleShot(COMPLETE_COLLAPSE_MS, self, self._collapse_status)
             # A terminal state may have made the watcher eligible.
             self._maybe_start_watcher()
 
