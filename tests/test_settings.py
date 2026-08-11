@@ -1,5 +1,4 @@
 import threading
-import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,19 +29,27 @@ def test_settings_constructs(qtbot, tmp_haydar):
     assert bool(w.windowFlags() & Qt.WindowStaysOnTopHint)
 
 def test_settings_ocr_detection_is_nonblocking(qtbot, tmp_haydar, monkeypatch):
+    """Constructing the window must not serialize on Tesseract detection.
+
+    Asserted structurally rather than against a wall-clock budget. An
+    ``elapsed < 0.1`` bound also timed Qt building five tabs of widgets, so it
+    tripped on a loaded runner even though detection was properly off-thread.
+    Here detection parks until the test releases it, so construction returning
+    before ``slow_detection`` returns is itself the proof.
+    """
     release = threading.Event()
+    detection_returned = threading.Event()
 
     def slow_detection():
-        release.wait(1)
+        release.wait(10)
+        detection_returned.set()
         return TesseractInfo(TesseractStatus.NOT_FOUND, None, None)
 
     monkeypatch.setattr("haydar.ui.settings.detect_tesseract", slow_detection)
-    started = time.perf_counter()
     w = SettingsWindow(HaydarConfig(folders=[], initialized=True))
-    elapsed = time.perf_counter() - started
     qtbot.addWidget(w)
 
-    assert elapsed < 0.1
+    assert not detection_returned.is_set(), "construction blocked on detection"
     assert w.ocr_status_label.text() == "Checking..."
     release.set()
     qtbot.waitUntil(lambda: "executable not found" in w.ocr_status_label.text())
@@ -51,11 +58,17 @@ def test_settings_ocr_detection_is_nonblocking(qtbot, tmp_haydar, monkeypatch):
 def test_settings_can_close_before_ocr_worker_finishes(qtbot, tmp_haydar, monkeypatch):
     """Destroying the window mid-detection must still retire its worker.
 
-    This waits on *this* window's job rather than on ``_active_ocr_jobs`` being
-    empty. The registry is class-level, every ``SettingsWindow`` in the suite
-    adds to it, and several tests return before their detection thread retires —
-    so asserting global emptiness waits on unrelated tests' threads and fails
-    whenever CI scheduling leaves one in flight.
+    Regression: ``worker.finished -> thread.quit`` used the default
+    AutoConnection, and because the ``QThread`` object itself lives in the GUI
+    thread that made the quit a *queued* call the GUI thread had to deliver.
+    Detection deliberately outlives the window, so once the window was destroyed
+    nothing guaranteed that call was ever delivered: the thread stayed parked in
+    ``exec()``, never emitted ``finished``, and never retired its job.
+
+    ``QThread.wait()`` is the assertion that pins this down, because it blocks
+    *without* processing events: it can only return if the detection thread ends
+    its own event loop. Polling with ``waitUntil`` instead would pump the queue
+    by hand and pass against either wiring.
 
     The window is deliberately not registered with ``qtbot``: this test destroys
     it, and pytest-qt's teardown would call ``close()`` on the freed C++ object,
@@ -72,10 +85,21 @@ def test_settings_can_close_before_ocr_worker_finishes(qtbot, tmp_haydar, monkey
     w = SettingsWindow(HaydarConfig(folders=[], initialized=True))
     job = SettingsWindow._active_ocr_jobs - before
     assert job, "constructing the window must register a detection job"
+    thread = w._ocr_thread
 
     w.close()
     w.deleteLater()
     release.set()
+
+    assert thread.wait(5000), "detection thread never ended its own event loop"
+    assert thread.isFinished()
+    # Retiring the registry entry is a queued hand-off to the GUI thread, so it
+    # lands on the next pass of the event loop rather than inside wait() above.
+    # This waits on *this* window's job rather than on ``_active_ocr_jobs`` being
+    # empty. The registry is class-level, every ``SettingsWindow`` in the suite
+    # adds to it, and several tests return before their detection thread retires —
+    # so asserting global emptiness waits on unrelated tests' threads and fails
+    # whenever CI scheduling leaves one in flight.
     qtbot.waitUntil(lambda: not (job & SettingsWindow._active_ocr_jobs))
 
 

@@ -457,14 +457,25 @@ class SettingsWindow(QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.result.connect(self._set_ocr_status)
-        worker.finished.connect(thread.quit)
+        # DirectConnection matters: `thread` lives in the GUI thread, so the
+        # default AutoConnection makes this quit() a *queued* call that the GUI
+        # thread has to deliver. Detection outlives the window on purpose
+        # (`detect_tesseract` can spend 5s in a subprocess probe, so closing must
+        # not block on it) — and once the window is gone nothing guarantees that
+        # queued call is ever delivered, leaving the thread parked in exec()
+        # forever, never emitting finished, never retiring its job. quit() is
+        # thread-safe, so let the detection thread end its own event loop.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         job = (thread, worker)
-        thread.finished.connect(lambda job=job: self._active_ocr_jobs.discard(job))
+        jobs = self._active_ocr_jobs
+        # Bind the registry, not `self`: the job must retire even when the window
+        # that started it has already been destroyed.
+        thread.finished.connect(lambda job=job: jobs.discard(job))
         self._ocr_thread = thread
         self._ocr_worker = worker
-        self._active_ocr_jobs.add(job)
+        jobs.add(job)
         thread.start()
 
     @Slot(object)
